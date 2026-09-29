@@ -98,6 +98,16 @@ read_first() {
     printf -v "$1" '%s' "$__rf_line"
 }
 
+# safe_read FILE [MAX_BYTES] -> REPLY : bounded, time-limited read of a regular,
+# non-symlink file. Used for files owned by less privileged users (www-data panel
+# files), which must never be able to hang or exhaust serverinfo running as root.
+safe_read() {
+    REPLY=""
+    [[ -f $1 && ! -L $1 && -r $1 ]] || return 1
+    REPLY=$(run_timeout 2 head -c "${2:-65536}" -- "$1" 2>/dev/null | tr -d '\0')
+    [[ -n $REPLY ]]
+}
+
 # trim STRING -> REPLY
 trim() {
     local s=$1
@@ -106,9 +116,21 @@ trim() {
     REPLY=$s
 }
 
+# utf8_safe STRING -> REPLY : valid UTF-8 passes unchanged; otherwise every
+# non-ASCII byte becomes '?' (keeps JSON valid, defeats raw 8-bit CSI bytes)
+utf8_safe() {
+    REPLY=$1
+    [[ $REPLY == *[![:ascii:]]* ]] || return 0
+    if ! iconv -f UTF-8 -t UTF-8 <<< "$REPLY" >/dev/null 2>&1; then
+        local LC_ALL=C
+        REPLY=${REPLY//[^ -~]/?}
+    fi
+}
+
 # clean STRING -> REPLY : strip control characters (escape injection guard) and trim
 clean() {
-    trim "${1//[[:cntrl:]]/}"
+    utf8_safe "$1"
+    trim "${REPLY//[[:cntrl:]]/}"
 }
 
 # repeat_str STRING COUNT -> REPLY
@@ -212,7 +234,8 @@ json_escape() {
     s=${s//$'\n'/\\n}
     s=${s//$'\t'/\\t}
     s=${s//$'\r'/\\r}
-    s=${s//[[:cntrl:]]/}
+    utf8_safe "$s"
+    s=${REPLY//[[:cntrl:]]/}
     REPLY="\"$s\""
 }
 
@@ -475,9 +498,9 @@ get_system_info() {
             val=${val%[\"\']}
             case $key in
                 PRETTY_NAME) clean "$val"; SYS_OS=$REPLY ;;
-                ID) SYS_OS_ID=$val ;;
-                VERSION_ID) SYS_OS_VERSION_ID=$val ;;
-                VERSION_CODENAME) SYS_CODENAME=$val ;;
+                ID) clean "$val"; SYS_OS_ID=$REPLY ;;
+                VERSION_ID) clean "$val"; SYS_OS_VERSION_ID=$REPLY ;;
+                VERSION_CODENAME) clean "$val"; SYS_CODENAME=$REPLY ;;
             esac
         done < /etc/os-release
     fi
@@ -879,10 +902,11 @@ get_disk_info() {
         esac
         # read-only mounts cannot fill up; bind mounts / btrfs subvolumes are duplicates
         [[ ${ro[$mnt]:-0} == 1 ]] && continue
+        pct_x10 "$used" $(( used + avail ))
+        entry="$mnt$FS_SEP$type$FS_SEP$size$FS_SEP$used$FS_SEP$avail$FS_SEP$REPLY$FS_SEP$src"
         [[ $src == /* && -n ${seen[$src]:-} ]] && continue
         seen[$src]=1
-        pct_x10 "$used" $(( used + avail ))
-        FS_LIST+=("$mnt$FS_SEP$type$FS_SEP$size$FS_SEP$used$FS_SEP$avail$FS_SEP$REPLY$FS_SEP$src")
+        FS_LIST+=("$entry")
     done <<< "$out"
 
     DISK_WORST_PCT_X10=$ROOT_PCT_X10 DISK_WORST_MOUNT="/"
@@ -922,7 +946,11 @@ resolve_physical_disks() {
         real=$(readlink -f "$sys" 2>/dev/null)
         parent=${real%/*}
         parent=${parent##*/}
-        [[ -n $parent && -e /sys/block/$parent ]] && n=$parent
+        if [[ -n $parent && $parent != "$n" && -e /sys/block/$parent ]]; then
+            # recurse: the parent may be stacked itself (md0p1 -> md0 -> member disks)
+            resolve_physical_disks "$parent" $(( depth + 1 ))
+            return
+        fi
     fi
     [[ -e /sys/block/$n ]] || return
     for x in "${RESOLVED_DISKS[@]}"; do
@@ -1007,33 +1035,25 @@ get_root_device_kind() {
     ROOT_LAYOUT=${ROOT_LAYOUT//$'\x1e'/ · }
 }
 
-# mount_of PATH -> REPLY (longest mount point prefix among known filesystems)
-mount_of() {
-    local path=$1 best="/" entry m
-    for entry in "${FS_LIST[@]}"; do
-        m=${entry%%"$FS_SEP"*}
-        if [[ $path == "$m" || $path == "$m"/* ]] && (( ${#m} > ${#best} )); then
-            best=$m
-        fi
-    done
-    REPLY=$best
-}
-
-# fs_usage_of PATH -> REPLY ("33.0% used · 1.2 TiB free (/var/lib/pterodactyl)")
+# fs_usage_of PATH -> REPLY ("33.0% used · 1.2 TiB free (/srv)")
+# Asks df about the path itself, so bind mounts (which df lists only once per
+# device) resolve to the right filesystem.
 fs_usage_of() {
-    local m entry f_m f_a f_p
-    mount_of "$1"
-    m=$REPLY
-    f_a=$ROOT_AVAIL f_p=$ROOT_PCT_X10
-    for entry in "${FS_LIST[@]}"; do
-        IFS=$FS_SEP read -r f_m _ _ _ f_a f_p _ <<< "$entry"
-        [[ $f_m == "$m" ]] && break
-        f_a=$ROOT_AVAIL f_p=$ROOT_PCT_X10
-    done
-    human_bytes "$f_a"
-    local free=$REPLY
-    fmt_x10 "$f_p"
-    REPLY="$REPLY% used · $free free ($m)"
+    local out size used avail mnt pct free
+    REPLY="N/A"
+    have df || return 1
+    out=$(run_timeout 3 df -PB1 -- "$1" 2>/dev/null)
+    [[ $out == *$'\n'* ]] || return 1
+    read -r _ size used avail _ mnt <<< "${out#*$'\n'}"
+    is_uint "$size" && is_uint "$used" && is_uint "$avail" || return 1
+    pct_x10 "$used" $(( used + avail ))
+    pct=$REPLY
+    human_bytes "$avail"
+    free=$REPLY
+    clean "$mnt"
+    mnt=$REPLY
+    fmt_x10 "$pct"
+    REPLY="$REPLY% used · $free free ($mnt)"
 }
 
 # ============================================================================
@@ -1166,7 +1186,7 @@ get_network_info() {
 
     local -a cidrs=()
     read -r -a cidrs <<< "${NET_V4_LIST[$NET_IFACE]:-}"
-    if (( ${#cidrs[@]} == 0 )) && have hostname; then
+    if (( ${#cidrs[@]} == 0 )) && ! have ip && have hostname; then
         # without iproute2: all non-loopback IPv4 addresses of the host
         for addr in $(hostname -I 2>/dev/null); do
             [[ $addr =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && cidrs+=("$addr")
@@ -1223,7 +1243,7 @@ get_public_ip() {
         fi
     done
     [[ $CFG_PUBLIC_IP_LOOKUP == yes ]] && have curl || return 1
-    out=$(run_timeout 5 curl -fsS --max-time 3 --connect-timeout 2 --proto '=https' "$CFG_PUBLIC_IP_URL" 2>/dev/null) || return 1
+    out=$(run_timeout 5 curl -q -fsS --max-time 3 --connect-timeout 2 --proto '=https' "$CFG_PUBLIC_IP_URL" 2>/dev/null) || return 1
     trim "$out"
     if [[ $REPLY =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
         NET_PUBLIC_IP=$REPLY NET_PUBLIC_SRC="lookup"
@@ -1307,21 +1327,37 @@ DOCKER_CONTAINERS="" DOCKER_RUNNING="" DOCKER_PAUSED="" DOCKER_STOPPED="" DOCKER
 DOCKER_DRIVER="" DOCKER_ROOT=""
 
 get_docker_info() {
-    local out rc v
-    DOCKER_INSTALLED=0 DOCKER_ACCESS=0 DOCKER_STATE="NOT INSTALLED"
+    local out rc
+    DOCKER_INSTALLED=0 DOCKER_ACCESS=0 DOCKER_STATE="NOT INSTALLED" DOCKER_VERSION=""
+    DOCKER_CONTAINERS="" DOCKER_RUNNING="" DOCKER_PAUSED="" DOCKER_STOPPED="" DOCKER_IMAGES=""
     if ! have docker && ! have dockerd && [[ ${SVC_LOAD[docker]:-} != loaded ]]; then
         return 0
     fi
     DOCKER_INSTALLED=1
     DOCKER_STATE="STOPPED"
-    if have docker; then
+    # Never wake a socket-activated daemon (docker.socket): only talk to Docker
+    # when the engine is already running.
+    local running=0 v
+    if (( HAVE_SYSTEMD )) && [[ ${SVC_LOAD[docker]:-} == loaded ]]; then
+        case ${SVC_ACTIVE[docker]:-} in
+            active|reloading) running=1 ;;
+            activating) DOCKER_STATE="STARTING" ;;
+        esac
+    elif process_running dockerd; then
+        running=1
+    fi
+    if (( running )) && have docker; then
         out=$(run_timeout 6 docker info --format '{{.ServerVersion}}|{{.Containers}}|{{.ContainersRunning}}|{{.ContainersPaused}}|{{.ContainersStopped}}|{{.Images}}|{{.Driver}}|{{.DockerRootDir}}' 2>/dev/null)
         rc=$?
         if (( rc == 0 )); then
             IFS='|' read -r DOCKER_VERSION DOCKER_CONTAINERS DOCKER_RUNNING DOCKER_PAUSED \
                 DOCKER_STOPPED DOCKER_IMAGES DOCKER_DRIVER DOCKER_ROOT <<< "$out"
         fi
-        if (( rc == 0 )) && [[ -n $DOCKER_VERSION ]] && is_uint "$DOCKER_CONTAINERS"; then
+        # every count is validated: foreign strings are never evaluated arithmetically
+        for v in DOCKER_CONTAINERS DOCKER_RUNNING DOCKER_PAUSED DOCKER_STOPPED DOCKER_IMAGES; do
+            is_uint "${!v}" || printf -v "$v" '%s' ""
+        done
+        if (( rc == 0 )) && [[ -n $DOCKER_VERSION && -n $DOCKER_CONTAINERS ]]; then
             DOCKER_ACCESS=1 DOCKER_STATE="RUNNING"
             clean "$DOCKER_VERSION"; DOCKER_VERSION=$REPLY
             clean "$DOCKER_DRIVER"; DOCKER_DRIVER=$REPLY
@@ -1330,13 +1366,16 @@ get_docker_info() {
         fi
         DOCKER_VERSION="" DOCKER_CONTAINERS="" DOCKER_RUNNING="" DOCKER_PAUSED=""
         DOCKER_STOPPED="" DOCKER_IMAGES="" DOCKER_DRIVER="" DOCKER_ROOT=""
-        [[ -S /var/run/docker.sock && ! -w /var/run/docker.sock ]] && DOCKER_STATE="NO ACCESS"
+        if [[ -S /var/run/docker.sock && ! -w /var/run/docker.sock ]]; then
+            DOCKER_STATE="NO ACCESS"
+        else
+            DOCKER_STATE="UNKNOWN"   # engine running but not answering
+        fi
+    fi
+    if [[ -z $DOCKER_VERSION ]] && have docker; then
+        # client version only - does not contact the daemon
         v=$(run_timeout 3 docker --version 2>/dev/null)
         [[ $v =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] && DOCKER_VERSION=${BASH_REMATCH[1]}
-    fi
-    if [[ $DOCKER_STATE != "NO ACCESS" ]]; then
-        service_state docker dockerd
-        [[ $REPLY == active ]] && DOCKER_STATE="UNKNOWN"   # daemon up but not answering
     fi
 }
 
@@ -1385,9 +1424,9 @@ yaml_get() {
         }' "$file" 2>/dev/null
 }
 
-# read_dotenv FILE KEY -> REPLY  (Laravel .env; first definition wins, like phpdotenv)
+# read_dotenv CONTENT KEY -> REPLY  (Laravel .env; first definition wins, like phpdotenv)
 read_dotenv() {
-    local file=$1 key=$2 line val out="" i ch
+    local content=$1 key=$2 line val out="" i ch
     REPLY=""
     while IFS= read -r line || [[ -n $line ]]; do
         line=${line%$'\r'}
@@ -1418,7 +1457,7 @@ read_dotenv() {
         fi
         REPLY=$val
         return 0
-    done < "$file"
+    done <<< "$content"
     return 1
 }
 
@@ -1461,21 +1500,20 @@ detect_pterodactyl() {
                 }
             }' "${confs[@]}" 2>/dev/null)
     fi
+    local re_composer='"name"[[:space:]]*:[[:space:]]*"pterodactyl/panel"'
     for dir in "${candidates[@]}"; do
         dir=${dir%/}
         [[ -d $dir && -f $dir/artisan ]] || continue
-        if [[ -f $dir/config/pterodactyl.php ]] || grep -qs '"name": *"pterodactyl/panel"' "$dir/composer.json"; then
+        if [[ -f $dir/config/pterodactyl.php ]] || { safe_read "$dir/composer.json" && [[ $REPLY =~ $re_composer ]]; }; then
             PANEL_DETECTED=1
             clean "$dir"; PANEL_PATH=$REPLY
             PANEL_WEBSERVER=${from_web[$dir]:-}
             break
         fi
     done
-    if (( PANEL_DETECTED )) && [[ -r $PANEL_PATH/config/app.php ]]; then
-        local v
-        v=$(sed -n "s/.*'version'[[:space:]]*=>[[:space:]]*'\([^']*\)'.*/\1/p" "$PANEL_PATH/config/app.php" 2>/dev/null)
-        v=${v%%$'\n'*}
-        [[ $v =~ ^[A-Za-z0-9._-]{1,32}$ ]] && PANEL_VERSION=$v
+    local re_version="'version'[[:space:]]*=>[[:space:]]*'([A-Za-z0-9._-]{1,32})'"
+    if (( PANEL_DETECTED )) && safe_read "$PANEL_PATH/config/app.php" 262144 && [[ $REPLY =~ $re_version ]]; then
+        PANEL_VERSION=${BASH_REMATCH[1]}
     fi
     PTERO_DETECTED=0
     (( PANEL_DETECTED || WINGS_INSTALLED )) && PTERO_DETECTED=1
@@ -1569,14 +1607,14 @@ wings_tls_name() {
 }
 
 # wings_api_request TOKEN URL [CURL ARGS...] -> stdout: "total running transitional suspended"
-# The token reaches curl only through stdin (--config -) and always over a direct
-# local connection (--noproxy: never through an HTTP(S)_PROXY). The raw response,
+# The token reaches curl only through stdin (--config -); -q ignores any .curlrc and
+# the connection is always direct (--noproxy: never via an HTTP(S)_PROXY). The raw response,
 # which contains server environment variables, is consumed by jq and never shown.
 wings_api_request() {
     local token=$1 url=$2
     shift 2
     printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\n' "$token" \
-        | run_timeout 7 curl --config - -fsS --noproxy '*' --max-time 6 --connect-timeout 2 --proto '=http,https' "$@" "$url" 2>/dev/null \
+        | run_timeout 7 curl -q --config - -fsS --noproxy '*' --max-time 6 --connect-timeout 2 --proto '=http,https' "$@" "$url" 2>/dev/null \
         | jq -r 'if type == "array" then [length,
                     (map(select(.state == "running")) | length),
                     (map(select(.state == "starting" or .state == "stopping")) | length),
@@ -1656,21 +1694,23 @@ docker_ptero_counts() {
 # queries). Credentials are parsed from .env, validated, and passed to the
 # client through an anonymous pipe (fd 3) - never argv, env or output.
 panel_db_counts() {
-    local env_file="$PANEL_PATH/.env" client="" conn host port db user pass prefix q out
+    local env_file="$PANEL_PATH/.env" env="" client="" conn host port db user pass prefix q out
     local a b c d
+    local re_host='^[A-Za-z0-9._:-]+$' re_port='^[0-9]{1,5}$' re_db='^[A-Za-z0-9_][A-Za-z0-9_$-]*$' re_prefix='^[A-Za-z0-9_]*$'
     [[ $CFG_PANEL_DATABASE == off ]] && return 1
-    [[ -f $env_file && -r $env_file ]] || return 1
     if have mariadb; then client=mariadb; elif have mysql; then client=mysql; else return 1; fi
-    read_dotenv "$env_file" DB_CONNECTION; conn=${REPLY:-mysql}
-    [[ $conn == mysql || $conn == mariadb ]] || return 1
-    read_dotenv "$env_file" DB_HOST;     host=${REPLY:-127.0.0.1}
-    read_dotenv "$env_file" DB_PORT;     port=${REPLY:-3306}
-    read_dotenv "$env_file" DB_DATABASE; db=${REPLY:-panel}
-    read_dotenv "$env_file" DB_USERNAME; user=${REPLY:-pterodactyl}
-    read_dotenv "$env_file" DB_PASSWORD; pass=$REPLY
-    read_dotenv "$env_file" DB_PREFIX;   prefix=$REPLY
-    REPLY=""
-    if ! [[ $host =~ ^[A-Za-z0-9._:-]+$ && $port =~ ^[0-9]{1,5}$ && $db =~ ^[A-Za-z0-9_$-]+$ && $prefix =~ ^[A-Za-z0-9_]*$ ]] \
+    # .env is owned by www-data: one bounded read, then parsed from memory
+    safe_read "$env_file" 65536 || return 1
+    env=$REPLY
+    read_dotenv "$env" DB_CONNECTION; conn=${REPLY:-mysql}
+    read_dotenv "$env" DB_HOST;     host=${REPLY:-127.0.0.1}
+    read_dotenv "$env" DB_PORT;     port=${REPLY:-3306}
+    read_dotenv "$env" DB_DATABASE; db=${REPLY:-panel}
+    read_dotenv "$env" DB_USERNAME; user=${REPLY:-pterodactyl}
+    read_dotenv "$env" DB_PASSWORD; pass=$REPLY
+    read_dotenv "$env" DB_PREFIX;   prefix=$REPLY
+    env="" REPLY=""
+    if ! [[ ($conn == mysql || $conn == mariadb) && $host =~ $re_host && $port =~ $re_port && $db =~ $re_db && $prefix =~ $re_prefix ]] \
         || [[ $user == *[$'\n\r']* || $pass == *[$'\n\r']* ]]; then
         pass=""
         return 1
@@ -1684,8 +1724,12 @@ panel_db_counts() {
     else
         q+=" NULL"
     fi
-    out=$(run_timeout 6 "$client" --defaults-extra-file=/dev/fd/3 --connect-timeout=3 -N -B -s -e "$q" "$db" 3< <(
-        printf '[client]\nuser="%s"\npassword="%s"\nhost="%s"\nport=%s\n' "$user" "$pass" "$host" "$port"
+    # Credentials travel through an anonymous pipe (fd 3), never argv/env.
+    # --defaults-file: no other option file (~/.my.cnf, /etc/mysql) can override them.
+    # --local-infile=0: a rogue server (DB_HOST comes from a www-data owned file)
+    # can never request local files from this root process.
+    out=$(run_timeout 6 "$client" --defaults-file=/dev/fd/3 --local-infile=0 --connect-timeout=3 -N -B -s -e "$q" 3< <(
+        printf '[client]\nuser="%s"\npassword="%s"\nhost="%s"\nport=%s\ndatabase="%s"\n' "$user" "$pass" "$host" "$port" "$db"
     ) 2>/dev/null)
     pass="" user=""
     IFS=$'\t' read -r a b c d <<< "$out"
@@ -1771,8 +1815,8 @@ get_health_status() {
     [[ $WINGS_STATE == OFFLINE ]] && level=2
     if (( WINGS_INSTALLED )); then
         case $DOCKER_STATE in
-            STOPPED|UNKNOWN) level=2 ;;
-            "NOT INSTALLED") level=2 ;;
+            STOPPED|UNKNOWN|"NOT INSTALLED") level=2 ;;
+            STARTING) (( level < 1 )) && level=1 ;;
         esac
     fi
     case $level in
@@ -1803,7 +1847,9 @@ load_color() {
         REPLY=$C_WHITE
         return
     fi
-    per=$(( (10#$whole * 100 + 10#$frac) / ${CPU_THREADS:-1} ))
+    local t=$CPU_THREADS
+    if ! is_uint "$t" || (( t == 0 )); then t=1; fi
+    per=$(( (10#$whole * 100 + 10#$frac) / t ))
     if (( per >= 100 )); then REPLY=$C_RED; elif (( per >= 70 )); then REPLY=$C_YELLOW; else REPLY=$C_GREEN; fi
 }
 
@@ -2046,10 +2092,7 @@ render_pterodactyl() {
     print_kv "Docker" "$DOCKER_STATE" "$REPLY$C_BOLD"
     if (( WINGS_INSTALLED )); then
         print_kv "Game Data" "$WINGS_DATA_DIR"
-        if (( ROOT_SIZE > 0 )); then
-            fs_usage_of "$WINGS_DATA_DIR"
-            print_kv "Data Disk" "$REPLY" "$C_GRAY"
-        fi
+        fs_usage_of "$WINGS_DATA_DIR" && print_kv "Data Disk" "$REPLY" "$C_GRAY"
     fi
 
     print_kv "Servers" "${PTERO_SERVERS:-N/A}" "$C_BOLD$C_WHITE"
@@ -2488,8 +2531,8 @@ live_mode() {
         get_memory_info
         get_disk_info
         if [[ -n $NET_IFACE ]]; then
-            read_first NET_RX "/sys/class/net/$NET_IFACE/statistics/rx_bytes" || NET_RX=$rx0
-            read_first NET_TX "/sys/class/net/$NET_IFACE/statistics/tx_bytes" || NET_TX=$tx0
+            if ! read_first NET_RX "/sys/class/net/$NET_IFACE/statistics/rx_bytes" || ! is_uint "$NET_RX"; then NET_RX=$rx0; fi
+            if ! read_first NET_TX "/sys/class/net/$NET_IFACE/statistics/tx_bytes" || ! is_uint "$NET_TX"; then NET_TX=$tx0; fi
             dt=$(( CPU_SAMPLE_US - us0 ))
             if (( dt > 0 )); then
                 LIVE_RX_RATE=$(( (NET_RX - rx0) * 1000000 / dt ))
@@ -2504,7 +2547,7 @@ live_mode() {
         frame=$(render_live_frame)
         printf '\e[H%s\e[K\e[J' "${frame//$'\n'/$'\e[K\n'}"
 
-        if read -rsn1 -t "$CFG_LIVE_INTERVAL" key < /dev/tty 2>/dev/null; then
+        if { read -rsn1 -t "$CFG_LIVE_INTERVAL" key < /dev/tty; } 2>/dev/null; then
             [[ $key == [qQ] ]] && break
         else
             rc=$?

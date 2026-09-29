@@ -246,9 +246,12 @@ place_file() {
 
 install_files() {
     step "3/4  Installing files"
-    local tmp
-    install -d -m 0755 /usr/local/bin "$LIB_DIR" "$CONF_DIR" "$COMPLETION_DIR" \
-        || die "Could not create the installation directories"
+    local tmp dir
+    # create only missing directories: existing ones keep their mode/owner
+    # (e.g. Debian's setgid root:staff /usr/local tree)
+    for dir in /usr/local/bin "$LIB_DIR" "$CONF_DIR" "$COMPLETION_DIR"; do
+        [[ -d $dir ]] || install -d -m 0755 "$dir" || die "Could not create directory $dir"
+    done
 
     place_file "$SRC_BIN" "$BIN_PATH" 0755 || die "Failed to install $BIN_PATH"
     ok "Installed $BIN_PATH"
@@ -273,7 +276,9 @@ install_files() {
 
     tmp=$(mktemp) || die "mktemp failed"
     TMP_FILES+=("$tmp")
-    if "$BIN_PATH" --completion > "$tmp" && place_file "$tmp" "$COMPLETION_FILE" 0644; then
+    if [[ -e $COMPLETION_FILE ]] && ! grep -qs "$SI_SIGNATURE" "$COMPLETION_FILE"; then
+        warn "$COMPLETION_FILE belongs to another program - bash completion not installed"
+    elif "$BIN_PATH" --completion > "$tmp" && place_file "$tmp" "$COMPLETION_FILE" 0644; then
         if [[ -f /usr/share/bash-completion/bash_completion ]]; then
             ok "Bash completion installed (serverinfo --<TAB>)"
         else

@@ -229,13 +229,15 @@ Fayl **faqat o'qiladi (parse)**, hech qachon bajarilmaydi (`source` qilinmaydi);
 ## Xavfsizlik
 
 - **Hech qachon chiqarilmaydi:** Wings token, DB parol, API tokenlar, `.env` qiymatlari, `/root/.bash_history`, SSH kalitlar, Cloudflare tokenlar
-- Wings tokeni `curl` ga faqat **stdin** orqali (`--config -`) beriladi — `ps` / `/proc/*/cmdline` da ko'rinmaydi, proxy orqali yuborilmaydi (`--noproxy`)
+- Wings tokeni `curl` ga faqat **stdin** orqali (`--config -`) beriladi — `ps` / `/proc/*/cmdline` da ko'rinmaydi; `~/.curlrc` o'qilmaydi (`curl -q`), proxy orqali yuborilmaydi (`--noproxy`)
 - Token faqat Wings porti **root'ga tegishli** jarayon tomonidan tinglanayotgan bo'lsa yuboriladi — oddiy foydalanuvchi portni egallab olsa, token unga berilmaydi
 - HTTPS'da sertifikat tekshiriladi (`--resolve` bilan to'g'ri hostname; self-signed bo'lsa aynan shu sertifikat bilan)
 - Wings API javobidagi server environment o'zgaruvchilari (RCON parollari va h.k.) ekranga chiqmaydi — faqat `jq` hisoblagan sonlar olinadi
-- Panel DB ga ulanish ma'lumotlari `mariadb` ga anonim pipe (`/dev/fd/3`) orqali uzatiladi — argv yoki environment'da emas; faqat `COUNT(*)` so'rovlari
+- Panel DB: ulanish ma'lumotlari `mariadb` ga anonim pipe (`--defaults-file=/dev/fd/3`) orqali uzatiladi — argv, environment yoki boshqa `my.cnf` fayllar orqali emas; `LOCAL INFILE` o'chirilgan (`--local-infile=0`); faqat `COUNT(*)` so'rovlari
+- www-data'ga tegishli Panel fayllari (`.env`, `config/app.php`, `composer.json`) faqat oddiy fayl bo'lsa, hajmi va vaqti cheklangan holda o'qiladi (FIFO/symlink hujumlari serverinfo'ni osib qo'ya olmaydi)
 - Panel papkasidagi PHP kod **ishga tushirilmaydi** (`php artisan` yo'q) — www-data → root privilege escalation xavfi yo'q
-- Tizimdan olingan barcha matnlar boshqaruv belgilaridan tozalanadi (terminal escape injection himoyasi)
+- To'xtatilgan Docker "uyg'otilmaydi": `docker.socket` faol bo'lsa ham, engine ishlamayotganda Docker API'ga murojaat qilinmaydi
+- Tizimdan olingan barcha matnlar boshqaruv belgilari va noto'g'ri UTF-8 baytlardan tozalanadi (terminal escape injection himoyasi, JSON doim valid)
 - Internetdan kod yuklanmaydi, masofaviy skript bajarilmaydi; yagona ixtiyoriy tashqi so'rov — `PUBLIC_IP_LOOKUP` (standartda o'chiq)
 
 ---
