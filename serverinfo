@@ -1,0 +1,2786 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  EliteHost ServerInfo
+#  Server information & monitoring CLI for Pterodactyl hosting nodes.
+#  Target platform: Debian 12 (bookworm) / Debian 13 (trixie), Bash 5.x
+#
+#  Signature: ELITEHOST-SERVERINFO   (used by install.sh / uninstall.sh)
+#  License  : MIT
+#
+#  Security model
+#   * Read-only. Never installs, starts, stops or reconfigures Pterodactyl,
+#     Wings, Docker or any other service.
+#   * Secrets (Wings token, panel database credentials, .env values) are
+#     never printed. They stay in memory and reach child processes only
+#     through pipes - never through argv or the environment.
+#   * Never downloads or executes remote code. The only optional outbound
+#     request is the public IP lookup, which is disabled by default.
+#   * Every string taken from the system is stripped of control characters
+#     before it is printed (terminal escape injection guard).
+# ============================================================================
+
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "serverinfo: bash is required (try: bash $0)" >&2
+    exit 1
+fi
+if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
+    echo "serverinfo: bash >= 5.0 is required" >&2
+    exit 1
+fi
+
+# No 'set -e': a monitoring tool must degrade gracefully, never abort
+# because an optional command is missing or returns non-zero.
+shopt -s nullglob
+umask 077
+export LC_ALL=C.UTF-8 2>/dev/null
+for __d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    case ":${PATH:-}:" in *":$__d:"*) ;; *) PATH="${PATH:+$PATH:}$__d" ;; esac
+done
+unset __d
+export PATH
+
+readonly SI_VERSION="1.0.0"
+readonly SI_NAME="EliteHost ServerInfo"
+readonly SI_CONFIG_FILE="${SERVERINFO_CONFIG:-/etc/elitehost/serverinfo.conf}"
+readonly SI_LIB_DIR="/usr/local/lib/elitehost-serverinfo"
+readonly SI_START_US="${EPOCHREALTIME//[!0-9]/}"
+
+# ----------------------------------------------------------------------------
+# Configuration (defaults; overridable in /etc/elitehost/serverinfo.conf)
+# ----------------------------------------------------------------------------
+CFG_BRAND_COLOR=135                    # 256-color index of the EliteHost brand color
+CFG_LOGO_COLORS="129 135 99 105 69 75" # logo gradient (one 256-color index per line)
+CFG_PUBLIC_IP_LOOKUP=no                # yes = ask an external service for the public IP
+CFG_PUBLIC_IP_URL="https://api.ipify.org"
+CFG_WINGS_CONFIG=/etc/pterodactyl/config.yml
+CFG_PANEL_DIR=""                       # empty = auto-detect
+CFG_WINGS_API=auto                     # auto | off
+CFG_PANEL_DATABASE=auto                # auto | off
+CFG_CPU_WARN=70
+CFG_CPU_CRIT=90
+CFG_RAM_WARN=80
+CFG_RAM_CRIT=90
+CFG_DISK_WARN=80
+CFG_DISK_CRIT=90
+CFG_LIVE_INTERVAL=2
+
+# ----------------------------------------------------------------------------
+# Generic helpers (functions return data in REPLY to avoid subshell forks)
+# ----------------------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+is_uint() { [[ $1 =~ ^[0-9]+$ ]]; }
+
+HAVE_TIMEOUT=0
+have timeout && HAVE_TIMEOUT=1
+
+# run_timeout SECONDS CMD [ARGS...] - run a command with a hard time limit
+run_timeout() {
+    local secs=$1
+    shift
+    if (( HAVE_TIMEOUT )); then
+        timeout -k 1 "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
+# nap SECONDS - sleep (fractions allowed); builtin fallback when sleep is unavailable
+nap() {
+    sleep "$1" 2>/dev/null || read -rt "$1" <> <(:) 2>/dev/null
+    return 0
+}
+
+# read_first VAR FILE - read the first line of FILE into VAR without forking
+read_first() {
+    local __rf_line=""
+    { IFS= read -r __rf_line < "$2"; } 2>/dev/null || [[ -n $__rf_line ]] || return 1
+    printf -v "$1" '%s' "$__rf_line"
+}
+
+# trim STRING -> REPLY
+trim() {
+    local s=$1
+    s=${s#"${s%%[![:space:]]*}"}
+    s=${s%"${s##*[![:space:]]}"}
+    REPLY=$s
+}
+
+# clean STRING -> REPLY : strip control characters (escape injection guard) and trim
+clean() {
+    trim "${1//[[:cntrl:]]/}"
+}
+
+# repeat_str STRING COUNT -> REPLY
+repeat_str() {
+    local out
+    printf -v out '%*s' "$2" ''
+    REPLY=${out// /$1}
+}
+
+# human_bytes BYTES -> REPLY (IEC units with one decimal, e.g. "1.8 TiB")
+human_bytes() {
+    local b=$1 i=0 div=1 scaled
+    local -a units=(B KiB MiB GiB TiB PiB EiB)
+    if ! is_uint "$b"; then
+        REPLY="N/A"
+        return 1
+    fi
+    while (( i < 6 && b >= div * 1024 )); do
+        div=$(( div * 1024 ))
+        i=$(( i + 1 ))
+    done
+    if (( i == 0 )); then
+        REPLY="$b B"
+        return 0
+    fi
+    scaled=$(( (b * 10 + div / 2) / div ))
+    if (( scaled >= 10240 && i < 6 )); then
+        div=$(( div * 1024 ))
+        i=$(( i + 1 ))
+        scaled=$(( (b * 10 + div / 2) / div ))
+    fi
+    REPLY="$(( scaled / 10 )).$(( scaled % 10 )) ${units[i]}"
+}
+
+# pct_x10 PART TOTAL -> REPLY (percentage * 10, rounded; 1 on unknown input)
+pct_x10() {
+    if is_uint "$1" && is_uint "$2" && (( $2 > 0 )); then
+        REPLY=$(( ($1 * 1000 + $2 / 2) / $2 ))
+        return 0
+    fi
+    REPLY=0
+    return 1
+}
+
+# fmt_x10 VALUE_X10 -> REPLY ("23.4")
+fmt_x10() {
+    REPLY="$(( $1 / 10 )).$(( $1 % 10 ))"
+}
+
+# plural N WORD -> REPLY ("1 day", "3 days")
+plural() {
+    if (( $1 == 1 )); then REPLY="$1 $2"; else REPLY="$1 ${2}s"; fi
+}
+
+# format_duration SECONDS [short] -> REPLY ("12 days, 4 hours, 3 minutes" | "12d 4h 3m")
+format_duration() {
+    local s=${1:-0} d h m
+    local -a parts=()
+    d=$(( s / 86400 ))
+    h=$(( s % 86400 / 3600 ))
+    m=$(( s % 3600 / 60 ))
+    if [[ ${2:-} == short ]]; then
+        (( d > 0 )) && parts+=("${d}d")
+        (( h > 0 )) && parts+=("${h}h")
+        (( d == 0 )) && parts+=("${m}m")
+        REPLY="${parts[*]}"
+        return 0
+    fi
+    if (( d > 0 )); then plural "$d" day; parts+=("$REPLY"); fi
+    if (( h > 0 )); then plural "$h" hour; parts+=("$REPLY"); fi
+    if (( d == 0 && (m > 0 || h == 0) )); then plural "$m" minute; parts+=("$REPLY"); fi
+    local IFS=','
+    REPLY="${parts[*]}"
+    REPLY=${REPLY//,/, }
+}
+
+# format_mhz MHZ -> REPLY ("3.10 GHz" | "800 MHz")
+format_mhz() {
+    local mhz=$1
+    if ! is_uint "$mhz" || (( mhz == 0 )); then
+        REPLY="N/A"
+        return 1
+    fi
+    if (( mhz >= 1000 )); then
+        local c=$(( (mhz + 5) / 10 ))
+        printf -v REPLY '%d.%02d GHz' $(( c / 100 )) $(( c % 100 ))
+    else
+        REPLY="$mhz MHz"
+    fi
+}
+
+# json_escape STRING -> REPLY (quoted JSON string, or null when empty)
+json_escape() {
+    local s=$1
+    if [[ -z $s ]]; then
+        REPLY=null
+        return 0
+    fi
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\t'/\\t}
+    s=${s//$'\r'/\\r}
+    s=${s//[[:cntrl:]]/}
+    REPLY="\"$s\""
+}
+
+# ----------------------------------------------------------------------------
+# Configuration loader - KEY=VALUE parser (the file is never sourced)
+# ----------------------------------------------------------------------------
+normalize_bool() {
+    case ${1,,} in
+        yes|true|on|1) REPLY=yes ;;
+        no|false|off|0) REPLY=no ;;
+        *) return 1 ;;
+    esac
+}
+
+load_config() {
+    local file=$SI_CONFIG_FILE line key val
+    [[ -r $file && -f $file ]] || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%$'\r'}
+        [[ $line =~ ^[[:space:]]*([A-Z][A-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+        key=${BASH_REMATCH[1]}
+        val=${BASH_REMATCH[2]}
+        if [[ $val =~ ^\"([^\"]*)\" ]] || [[ $val =~ ^\'([^\']*)\' ]]; then
+            val=${BASH_REMATCH[1]}
+        else
+            val=${val%%#*}
+            trim "$val"
+            val=$REPLY
+        fi
+        case $key in
+            BRAND_COLOR)
+                is_uint "$val" && (( 10#$val <= 255 )) && CFG_BRAND_COLOR=$(( 10#$val )) ;;
+            LOGO_COLORS)
+                [[ $val =~ ^[0-9\ ]+$ ]] && CFG_LOGO_COLORS=$val ;;
+            PUBLIC_IP_LOOKUP)
+                normalize_bool "$val" && CFG_PUBLIC_IP_LOOKUP=$REPLY ;;
+            PUBLIC_IP_URL)
+                [[ $val =~ ^https://[A-Za-z0-9./?=_%:~-]+$ ]] && CFG_PUBLIC_IP_URL=$val ;;
+            WINGS_CONFIG)
+                [[ $val == /* ]] && CFG_WINGS_CONFIG=$val ;;
+            PANEL_DIR)
+                [[ -z $val || $val == /* ]] && CFG_PANEL_DIR=${val%/} ;;
+            WINGS_API)
+                [[ $val == auto || $val == off ]] && CFG_WINGS_API=$val ;;
+            PANEL_DATABASE)
+                [[ $val == auto || $val == off ]] && CFG_PANEL_DATABASE=$val ;;
+            CPU_WARN|CPU_CRIT|RAM_WARN|RAM_CRIT|DISK_WARN|DISK_CRIT)
+                is_uint "$val" && (( 10#$val <= 100 )) && printf -v "CFG_$key" '%d' $(( 10#$val )) ;;
+            LIVE_INTERVAL)
+                is_uint "$val" && (( 10#$val >= 1 && 10#$val <= 60 )) && CFG_LIVE_INTERVAL=$(( 10#$val )) ;;
+        esac
+    done < "$file"
+}
+
+# ----------------------------------------------------------------------------
+# Terminal: colors & layout
+# ----------------------------------------------------------------------------
+COLOR_MODE=auto   # auto | always | never
+USE_COLOR=0
+C_RST="" C_BOLD="" C_BRAND="" C_WHITE="" C_CYAN="" C_GREEN="" C_YELLOW="" C_RED="" C_GRAY=""
+LOGO_COLORS=()
+
+setup_colors() {
+    case $COLOR_MODE in
+        never) USE_COLOR=0 ;;
+        always) USE_COLOR=1 ;;
+        *)
+            USE_COLOR=0
+            [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]] && USE_COLOR=1
+            ;;
+    esac
+    C_RST="" C_BOLD="" C_BRAND="" C_WHITE="" C_CYAN="" C_GREEN="" C_YELLOW="" C_RED="" C_GRAY=""
+    LOGO_COLORS=()
+    (( USE_COLOR )) || return 0
+
+    local ncolors=0 c
+    if have tput; then
+        ncolors=$(tput colors 2>/dev/null) || ncolors=0
+    fi
+    is_uint "$ncolors" || ncolors=0
+    case ${COLORTERM:-} in truecolor|24bit) ncolors=256 ;; esac
+    [[ ${TERM:-} == *256color* ]] && (( ncolors < 256 )) && ncolors=256
+
+    C_RST=$'\e[0m'
+    C_BOLD=$'\e[1m'
+    if (( ncolors >= 16 )); then
+        C_WHITE=$'\e[97m' C_CYAN=$'\e[96m' C_GREEN=$'\e[92m'
+        C_YELLOW=$'\e[93m' C_RED=$'\e[91m' C_GRAY=$'\e[90m'
+    else
+        C_WHITE=$'\e[1;37m' C_CYAN=$'\e[36m' C_GREEN=$'\e[32m'
+        C_YELLOW=$'\e[33m' C_RED=$'\e[31m' C_GRAY=$'\e[37m'
+    fi
+    if (( ncolors >= 256 )); then
+        C_BRAND=$'\e[38;5;'"${CFG_BRAND_COLOR}m"
+        for c in $CFG_LOGO_COLORS; do
+            (( 10#$c <= 255 )) && LOGO_COLORS+=($'\e[38;5;'"$(( 10#$c ))m")
+        done
+    else
+        C_BRAND=$'\e[35m'
+    fi
+}
+
+W=58          # layout width (columns)
+KEY_W=14      # key column width
+BAR_W=24      # progress bar width
+RULE=""
+
+setup_layout() {
+    local cols=0
+    if [[ -t 1 ]]; then
+        if have tput; then cols=$(tput cols 2>/dev/null) || cols=0; fi
+        if ! is_uint "$cols" || (( cols == 0 )); then
+            read -r _ cols < <(stty size 2>/dev/null < /dev/tty) || cols=0
+        fi
+    fi
+    is_uint "$cols" && (( cols > 0 )) || cols=80
+    W=58
+    (( cols - 2 < W )) && W=$(( cols - 2 ))
+    (( W < 40 )) && W=40
+    BAR_W=$(( W - KEY_W - 12 ))
+    (( BAR_W > 24 )) && BAR_W=24
+    (( BAR_W < 8 )) && BAR_W=8
+    repeat_str "─" "$W"
+    RULE=$REPLY
+}
+
+# ----------------------------------------------------------------------------
+# Output primitives
+# ----------------------------------------------------------------------------
+print_section() {
+    printf '\n %s%s%s%s\n' "$C_BOLD" "$C_BRAND" "$1" "$C_RST"
+    printf ' %s%s%s\n' "$C_GRAY" "$RULE" "$C_RST"
+}
+
+# print_kv KEY VALUE [COLOR]   (pass "" as COLOR for pre-colored values)
+print_kv() {
+    local color=${3-$C_WHITE}
+    [[ $2 == N/A* ]] && color=$C_GRAY
+    printf ' %s%-*s%s %s%s%s\n' "$C_GRAY" "$KEY_W" "$1" "$C_RST" "$color" "$2" "$C_RST"
+}
+
+# print_status LABEL STATE
+print_status() {
+    state_color "$2"
+    printf ' %s●%s %-13s%s%s%s%s\n' "$REPLY" "$C_RST" "$1" "$C_BOLD" "$REPLY" "$2" "$C_RST"
+}
+
+# state_color STATE -> REPLY (color escape for a status word)
+state_color() {
+    case $1 in
+        HEALTHY|ONLINE|RUNNING|DETECTED|UP|ACTIVE) REPLY=$C_GREEN ;;
+        WARNING|STARTING|UNKNOWN|"NO ACCESS"|DEGRADED) REPLY=$C_YELLOW ;;
+        HIGH|CRITICAL|OFFLINE|STOPPED|DOWN|FAILED) REPLY=$C_RED ;;
+        *) REPLY=$C_GRAY ;;
+    esac
+}
+
+# level_color PCT_X10 WARN CRIT -> REPLY
+level_color() {
+    if (( $1 >= $3 * 10 )); then
+        REPLY=$C_RED
+    elif (( $1 >= $2 * 10 )); then
+        REPLY=$C_YELLOW
+    else
+        REPLY=$C_GREEN
+    fi
+}
+
+# make_bar PCT_X10 WIDTH COLOR -> REPLY
+make_bar() {
+    local p=$1 w=$2 color=$3 fill filled
+    (( p < 0 )) && p=0
+    (( p > 1000 )) && p=1000
+    fill=$(( (p * w + 500) / 1000 ))
+    repeat_str "█" "$fill"
+    filled=$REPLY
+    repeat_str "░" $(( w - fill ))
+    REPLY="${color}${filled}${C_GRAY}${REPLY}${C_RST}"
+}
+
+# usage_value PCT_X10 WARN CRIT -> REPLY ("<bar> 23.4%", colored)
+usage_value() {
+    local color
+    level_color "$1" "$2" "$3"
+    color=$REPLY
+    make_bar "$1" "$BAR_W" "$color"
+    local bar=$REPLY
+    fmt_x10 "$1"
+    printf -v REPLY '%s %s%5s%%%s' "$bar" "$color$C_BOLD" "$REPLY" "$C_RST"
+}
+
+# print_box PLAIN COLORED [PLAIN COLORED ...] - centered lines inside a rounded box
+print_box() {
+    local inner=$(( W - 1 )) plain colored pl pr hr
+    repeat_str "─" "$inner"
+    hr=$REPLY
+    printf '%s╭%s╮%s\n' "$C_BRAND" "$hr" "$C_RST"
+    while (( $# >= 2 )); do
+        plain=$1 colored=$2
+        shift 2
+        if (( ${#plain} > inner )); then
+            plain=${plain:0:inner}
+            colored=$plain
+        fi
+        pl=$(( (inner - ${#plain}) / 2 ))
+        pr=$(( inner - ${#plain} - pl ))
+        printf '%s│%s%*s%s%*s%s│%s\n' "$C_BRAND" "$C_RST" "$pl" '' "$colored" "$pr" '' "$C_BRAND" "$C_RST"
+    done
+    printf '%s╰%s╯%s\n' "$C_BRAND" "$hr" "$C_RST"
+}
+
+print_logo() {
+    local -a logo=(
+        '███████╗██╗     ██╗████████╗███████╗'
+        '██╔════╝██║     ██║╚══██╔══╝██╔════╝'
+        '█████╗  ██║     ██║   ██║   █████╗  '
+        '██╔══╝  ██║     ██║   ██║   ██╔══╝  '
+        '███████╗███████╗██║   ██║   ███████╗'
+        '╚══════╝╚══════╝╚═╝   ╚═╝   ╚══════╝'
+    )
+    local i pad color
+    pad=$(( (W + 1 - 36) / 2 ))
+    echo
+    for i in "${!logo[@]}"; do
+        color=${LOGO_COLORS[i]:-$C_BRAND}
+        printf '%*s%s%s%s\n' "$pad" '' "$color" "${logo[i]}" "$C_RST"
+    done
+    pad=$(( (W + 1 - 20) / 2 ))
+    printf '%*s%s%sELITEHOST%s %s%sSERVERINFO%s\n\n' "$pad" '' \
+        "$C_BOLD" "$C_BRAND" "$C_RST" "$C_BOLD" "$C_WHITE" "$C_RST"
+}
+
+msg_err() { printf '%sserverinfo:%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
+
+# ============================================================================
+# SYSTEM
+# ============================================================================
+SYS_OS="Linux" SYS_OS_ID="" SYS_OS_VERSION_ID="" SYS_CODENAME="" SYS_DEBIAN_VERSION=""
+SYS_OS_SHORT="" SYS_KERNEL="" SYS_ARCH="" SYS_HOSTNAME="" SYS_UPTIME_S=0
+SYS_BOOT_TIME="" SYS_DATETIME="" SYS_TIMEZONE="" SYS_UTC_OFFSET=""
+SYS_VIRT="" SYS_VIRT_LABEL="" SYS_VENDOR="" SYS_MODEL=""
+NOW_EPOCH=0
+
+is_placeholder_dmi() {
+    case ${1,,} in
+        ""|"to be filled by o.e.m."|"default string"|"system product name"|"system manufacturer"|\
+        "not specified"|"not applicable"|"not available"|none|"o.e.m."|oem|"system version"|\
+        unknown|type1productconfigid|0123456789|123456789|x.x|"base board product name"|\
+        "base board manufacturer"|"system serial number")
+            return 0 ;;
+    esac
+    return 1
+}
+
+get_system_info() {
+    local key val ver
+    if [[ -r /etc/os-release ]]; then
+        while IFS='=' read -r key val; do
+            val=${val#[\"\']}
+            val=${val%[\"\']}
+            case $key in
+                PRETTY_NAME) clean "$val"; SYS_OS=$REPLY ;;
+                ID) SYS_OS_ID=$val ;;
+                VERSION_ID) SYS_OS_VERSION_ID=$val ;;
+                VERSION_CODENAME) SYS_CODENAME=$val ;;
+            esac
+        done < /etc/os-release
+    fi
+    if read_first SYS_DEBIAN_VERSION /etc/debian_version; then
+        clean "$SYS_DEBIAN_VERSION"
+        SYS_DEBIAN_VERSION=$REPLY
+    fi
+    if [[ $SYS_OS_ID != debian ]]; then
+        SYS_DEBIAN_VERSION=""   # derivatives (e.g. Ubuntu) ship /etc/debian_version too
+    fi
+    if [[ $SYS_OS_ID == debian ]]; then
+        ver=$SYS_OS_VERSION_ID
+        [[ $SYS_DEBIAN_VERSION =~ ^[0-9]+(\.[0-9]+)?$ ]] && ver=$SYS_DEBIAN_VERSION
+        SYS_OS_SHORT="Debian ${ver:-testing}${SYS_CODENAME:+ ($SYS_CODENAME)}"
+    else
+        SYS_OS_SHORT=$SYS_OS
+    fi
+
+    read_first SYS_KERNEL /proc/sys/kernel/osrelease || SYS_KERNEL=$(uname -r 2>/dev/null)
+    SYS_ARCH=$(uname -m 2>/dev/null) || SYS_ARCH=${HOSTTYPE:-unknown}
+    read_first SYS_HOSTNAME /proc/sys/kernel/hostname || SYS_HOSTNAME=$(uname -n 2>/dev/null)
+    clean "$SYS_HOSTNAME"
+    SYS_HOSTNAME=${REPLY:-localhost}
+
+    get_clock
+    printf -v SYS_BOOT_TIME '%(%Y-%m-%d %H:%M:%S)T' $(( NOW_EPOCH - SYS_UPTIME_S ))
+    get_timezone
+    detect_virtualization
+    get_hardware_model
+}
+
+# get_clock - uptime and current date/time (cheap; refreshed every live frame)
+get_clock() {
+    local up=""
+    read_first up /proc/uptime
+    SYS_UPTIME_S=${up%%.*}
+    is_uint "$SYS_UPTIME_S" || SYS_UPTIME_S=0
+    printf -v NOW_EPOCH '%(%s)T' -1
+    printf -v SYS_DATETIME '%(%Y-%m-%d %H:%M:%S)T' "$NOW_EPOCH"
+}
+
+get_timezone() {
+    local tz="" link off
+    if [[ -L /etc/localtime ]]; then
+        link=$(readlink /etc/localtime 2>/dev/null)
+        [[ $link == *zoneinfo/* ]] && tz=${link##*zoneinfo/}
+    fi
+    [[ -z $tz ]] && read_first tz /etc/timezone
+    [[ -z $tz && -n ${TZ:-} ]] && tz=$TZ
+    clean "$tz"
+    SYS_TIMEZONE=${REPLY:-UTC}
+    printf -v off '%(%z)T' -1
+    SYS_UTC_OFFSET="UTC${off:0:3}:${off:3:2}"
+}
+
+detect_virtualization() {
+    local v=""
+    if have systemd-detect-virt; then
+        v=$(run_timeout 2 systemd-detect-virt 2>/dev/null)
+    fi
+    if [[ -z $v ]]; then
+        if [[ -f /.dockerenv ]]; then
+            v=docker
+        elif [[ -f /run/.containerenv ]]; then
+            v=podman
+        elif grep -qw -m1 hypervisor /proc/cpuinfo 2>/dev/null; then
+            v=vm
+        elif [[ $SYS_ARCH == x86_64 || $SYS_ARCH == i?86 ]]; then
+            v=none
+        fi
+    fi
+    SYS_VIRT=${v:-unknown}
+    case $SYS_VIRT in
+        none)            SYS_VIRT_LABEL="None (bare-metal)" ;;
+        kvm)             SYS_VIRT_LABEL="KVM" ;;
+        qemu)            SYS_VIRT_LABEL="QEMU" ;;
+        vmware)          SYS_VIRT_LABEL="VMware" ;;
+        microsoft)       SYS_VIRT_LABEL="Microsoft Hyper-V" ;;
+        xen)             SYS_VIRT_LABEL="Xen" ;;
+        oracle)          SYS_VIRT_LABEL="Oracle VirtualBox" ;;
+        amazon)          SYS_VIRT_LABEL="Amazon EC2 (Nitro)" ;;
+        google)          SYS_VIRT_LABEL="Google Compute Engine" ;;
+        parallels)       SYS_VIRT_LABEL="Parallels" ;;
+        bhyve)           SYS_VIRT_LABEL="bhyve" ;;
+        openvz)          SYS_VIRT_LABEL="OpenVZ (container)" ;;
+        lxc|lxc-libvirt) SYS_VIRT_LABEL="LXC (container)" ;;
+        systemd-nspawn)  SYS_VIRT_LABEL="systemd-nspawn (container)" ;;
+        docker)          SYS_VIRT_LABEL="Docker (container)" ;;
+        podman)          SYS_VIRT_LABEL="Podman (container)" ;;
+        wsl)             SYS_VIRT_LABEL="WSL" ;;
+        vm)              SYS_VIRT_LABEL="Virtual machine" ;;
+        unknown)         SYS_VIRT_LABEL="N/A" ;;
+        *)               clean "$SYS_VIRT"; SYS_VIRT_LABEL=$REPLY ;;
+    esac
+}
+
+is_virtual_machine() {
+    case $SYS_VIRT in none|unknown|docker|podman|lxc|lxc-libvirt|openvz|systemd-nspawn) return 1 ;; esac
+    return 0
+}
+
+get_hardware_model() {
+    local d=/sys/class/dmi/id vendor="" product="" bvendor="" bname="" dt="" var
+    read_first vendor "$d/sys_vendor"
+    read_first product "$d/product_name"
+    read_first bvendor "$d/board_vendor"
+    read_first bname "$d/board_name"
+    for var in vendor product bvendor bname; do
+        clean "${!var}"
+        is_placeholder_dmi "$REPLY" && REPLY=""
+        printf -v "$var" '%s' "$REPLY"
+    done
+    SYS_VENDOR=${vendor:-$bvendor}
+    if [[ -n $product && -n $bname && $bname != "$product" ]]; then
+        SYS_MODEL="$product (board $bname)"
+    else
+        SYS_MODEL=${product:-$bname}
+    fi
+    if [[ -z $SYS_MODEL && -r /sys/firmware/devicetree/base/model ]]; then
+        { IFS= read -r -d '' dt < /sys/firmware/devicetree/base/model; } 2>/dev/null
+        clean "$dt"
+        SYS_MODEL=$REPLY
+    fi
+}
+
+# ============================================================================
+# CPU
+# ============================================================================
+CPU_MODEL="" CPU_VENDOR="" CPU_CORES="" CPU_THREADS="" CPU_SOCKETS=""
+CPU_FREQ_MHZ="" CPU_MAX_MHZ="" CPU_TEMP_C="" CPU_USAGE_X10=""
+CPU_LOAD1="" CPU_LOAD5="" CPU_LOAD15="" CPU_TASKS="" CPU_RUNNING=""
+CPU_SAMPLE_TOTAL=0 CPU_SAMPLE_IDLE=0 CPU_SAMPLE_US=0 CPU_LSCPU_MHZ=""
+
+# cpu_sample - snapshot of the aggregate "cpu" line of /proc/stat
+cpu_sample() {
+    local label user=0 nice=0 system=0 idle=0 iowait=0 irq=0 softirq=0 steal=0 rest
+    { read -r label user nice system idle iowait irq softirq steal rest < /proc/stat; } 2>/dev/null
+    CPU_SAMPLE_TOTAL=$(( ${user:-0} + ${nice:-0} + ${system:-0} + ${idle:-0} + ${iowait:-0} + ${irq:-0} + ${softirq:-0} + ${steal:-0} ))
+    CPU_SAMPLE_IDLE=$(( ${idle:-0} + ${iowait:-0} ))
+    CPU_SAMPLE_US=${EPOCHREALTIME//[!0-9]/}
+}
+
+# measure_cpu_usage [MIN_WINDOW_US] - real-time usage since the previous
+# cpu_sample; waits only for whatever part of the window has not elapsed yet.
+measure_cpu_usage() {
+    local t0=$CPU_SAMPLE_TOTAL i0=$CPU_SAMPLE_IDLE us0=$CPU_SAMPLE_US min_us=${1:-500000}
+    local now wait dt di
+    now=${EPOCHREALTIME//[!0-9]/}
+    wait=$(( min_us - (now - us0) ))
+    if (( wait > 0 )); then
+        printf -v wait '%d.%06d' $(( wait / 1000000 )) $(( wait % 1000000 ))
+        nap "$wait"
+    fi
+    cpu_sample
+    dt=$(( CPU_SAMPLE_TOTAL - t0 ))
+    di=$(( CPU_SAMPLE_IDLE - i0 ))
+    CPU_USAGE_X10=0
+    if (( dt > 0 )); then
+        CPU_USAGE_X10=$(( (1000 * (dt - di) + dt / 2) / dt ))
+        (( CPU_USAGE_X10 < 0 )) && CPU_USAGE_X10=0
+        (( CPU_USAGE_X10 > 1000 )) && CPU_USAGE_X10=1000
+    fi
+}
+
+get_cpu_info() {
+    local out="" line key val tpc="" cps="" sockets="" max_mhz="" cur_mhz="" v f
+    if have lscpu; then
+        out=$(run_timeout 3 lscpu 2>/dev/null)
+    fi
+    while IFS= read -r line; do
+        [[ $line == *:* ]] || continue
+        trim "${line%%:*}"; key=$REPLY
+        trim "${line#*:}"; val=$REPLY
+        case $key in
+            "Model name")          [[ -z $CPU_MODEL ]] && CPU_MODEL=$val ;;
+            "Vendor ID")           [[ -z $CPU_VENDOR ]] && CPU_VENDOR=$val ;;
+            "CPU(s)")              [[ -z $CPU_THREADS ]] && CPU_THREADS=$val ;;
+            "Thread(s) per core")  [[ -z $tpc ]] && tpc=$val ;;
+            "Core(s) per socket"|"Core(s) per cluster") [[ -z $cps ]] && cps=$val ;;
+            "Socket(s)")           [[ -z $sockets ]] && sockets=$val ;;
+            "CPU max MHz")         [[ -z $max_mhz ]] && max_mhz=${val%%.*} ;;
+            "CPU MHz")             [[ -z $cur_mhz ]] && cur_mhz=${val%%.*} ;;
+        esac
+    done <<< "$out"
+
+    if [[ -z $CPU_MODEL && -r /proc/cpuinfo ]]; then
+        while IFS= read -r line; do
+            case $line in
+                "model name"*|"cpu model"*|"Model"*|"Hardware"*) CPU_MODEL=${line#*:}; break ;;
+            esac
+        done < /proc/cpuinfo
+    fi
+    # "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz" -> "Intel Xeon E5-2680 v4 @ 2.40GHz"
+    clean "$CPU_MODEL"
+    v=$REPLY
+    v=${v//(R)/}; v=${v//(r)/}; v=${v//(TM)/}; v=${v//(tm)/}
+    v=${v// CPU / }
+    [[ $v =~ ^(.*[^ ])\ +[0-9]+-Core\ Processor$ ]] && v=${BASH_REMATCH[1]}
+    v=${v% Processor}
+    while [[ $v == *"  "* ]]; do v=${v//  / }; done
+    CPU_MODEL=${v:-Unknown}
+    clean "$CPU_VENDOR"; CPU_VENDOR=$REPLY
+
+    if ! is_uint "$CPU_THREADS"; then
+        CPU_THREADS=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || CPU_THREADS=""
+    fi
+    if ! is_uint "$CPU_THREADS" && read_first v /sys/devices/system/cpu/online; then
+        count_cpu_list "$v" && CPU_THREADS=$REPLY
+    fi
+
+    # Physical cores / sockets from sysfs topology (architecture independent)
+    local -A seen_core=() seen_pkg=()
+    local topo core pkg cluster
+    for topo in /sys/devices/system/cpu/cpu[0-9]*/topology; do
+        read_first core "$topo/core_id" || continue
+        read_first pkg "$topo/physical_package_id" || pkg=0
+        cluster=""
+        read_first cluster "$topo/cluster_id"
+        seen_core["$pkg:$cluster:$core"]=1
+        seen_pkg["$pkg"]=1
+    done
+    if (( ${#seen_core[@]} > 0 )); then
+        CPU_CORES=${#seen_core[@]}
+    elif is_uint "$cps" && is_uint "$sockets"; then
+        CPU_CORES=$(( cps * sockets ))
+    fi
+    if is_uint "$sockets"; then
+        CPU_SOCKETS=$sockets
+    elif (( ${#seen_pkg[@]} > 0 )); then
+        CPU_SOCKETS=${#seen_pkg[@]}
+    fi
+    if is_uint "$CPU_CORES" && is_uint "$CPU_THREADS" && (( CPU_CORES > CPU_THREADS )); then
+        CPU_CORES=$CPU_THREADS
+    fi
+
+    if read_first v /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq && is_uint "$v"; then
+        CPU_MAX_MHZ=$(( v / 1000 ))
+    elif is_uint "$max_mhz"; then
+        CPU_MAX_MHZ=$max_mhz
+    fi
+    CPU_LSCPU_MHZ=$cur_mhz
+    get_cpu_dynamic
+}
+
+# count_cpu_list LIST -> REPLY ("0-3,5,7-8" -> 7)
+count_cpu_list() {
+    local part n=0 a b
+    local -a parts=()
+    IFS=, read -r -a parts <<< "$1"
+    for part in "${parts[@]}"; do
+        if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            a=$(( 10#${BASH_REMATCH[1]} )) b=$(( 10#${BASH_REMATCH[2]} ))
+            (( b >= a )) && n=$(( n + b - a + 1 ))
+        elif is_uint "$part"; then
+            n=$(( n + 1 ))
+        fi
+    done
+    (( n > 0 )) || return 1
+    REPLY=$n
+}
+
+# get_cpu_dynamic - frequency, load average, processes, temperature (cheap; live mode)
+get_cpu_dynamic() {
+    local f v sum=0 n=0 l1 l5 l15 procs
+    for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
+        if read_first v "$f" && is_uint "$v"; then
+            sum=$(( sum + v ))
+            n=$(( n + 1 ))
+        fi
+    done
+    if (( n > 0 )); then
+        CPU_FREQ_MHZ=$(( sum / n / 1000 ))
+    elif is_uint "$CPU_LSCPU_MHZ" && (( CPU_LSCPU_MHZ > 0 )); then
+        CPU_FREQ_MHZ=$CPU_LSCPU_MHZ
+    elif [[ -r /proc/cpuinfo ]]; then
+        CPU_FREQ_MHZ=$(awk -F: '/^cpu MHz/ { s += $2; n++ } END { if (n) printf "%d", s / n }' /proc/cpuinfo 2>/dev/null)
+    fi
+    if { read -r l1 l5 l15 procs _ < /proc/loadavg; } 2>/dev/null; then
+        CPU_LOAD1=$l1 CPU_LOAD5=$l5 CPU_LOAD15=$l15
+        CPU_RUNNING=${procs%/*} CPU_TASKS=${procs#*/}
+    fi
+    get_cpu_temp
+}
+
+# get_cpu_temp - CPU package temperature from hwmon/thermal sysfs (no lm-sensors needed)
+get_cpu_temp() {
+    local hw name input label t best="" pref="" zone type
+    CPU_TEMP_C=""
+    for hw in /sys/class/hwmon/hwmon*; do
+        read_first name "$hw/name" || continue
+        case $name in
+            coretemp|k10temp|zenpower|cpu_thermal|cpu-thermal|soc_thermal|x86_pkg_temp|cputemp) ;;
+            *) continue ;;
+        esac
+        for input in "$hw"/temp*_input; do
+            if ! read_first t "$input" || ! is_uint "$t"; then continue; fi
+            t=$(( (t + 500) / 1000 ))
+            (( t > 0 && t < 150 )) || continue
+            label=""
+            read_first label "${input%_input}_label"
+            case $label in
+                "Package id"*|Tctl|Tdie) (( t > ${pref:-0} )) && pref=$t ;;
+            esac
+            (( t > ${best:-0} )) && best=$t
+        done
+    done
+    if [[ -z $pref && -z $best ]]; then
+        for zone in /sys/class/thermal/thermal_zone*; do
+            read_first type "$zone/type" || continue
+            case $type in
+                x86_pkg_temp|cpu-thermal|cpu_thermal|soc-thermal|soc_thermal|cpu*) ;;
+                *) continue ;;
+            esac
+            if ! read_first t "$zone/temp" || ! is_uint "$t"; then continue; fi
+            t=$(( (t + 500) / 1000 ))
+            (( t > 0 && t < 150 && t > ${best:-0} )) && best=$t
+        done
+    fi
+    CPU_TEMP_C=${pref:-$best}
+}
+
+# ============================================================================
+# MEMORY
+# ============================================================================
+MEM_TOTAL=0 MEM_FREE=0 MEM_AVAILABLE=0 MEM_USED=0 MEM_CACHED=0 MEM_PCT_X10=0
+SWAP_TOTAL=0 SWAP_FREE=0 SWAP_USED=0 SWAP_PCT_X10=0
+
+get_memory_info() {
+    local key val unit buffers=0 cached=0 sreclaim=0 avail=""
+    MEM_TOTAL=0 MEM_FREE=0 SWAP_TOTAL=0 SWAP_FREE=0
+    [[ -r /proc/meminfo ]] || return 1
+    while read -r key val unit; do
+        is_uint "$val" || continue
+        case $key in
+            MemTotal:)     MEM_TOTAL=$(( val * 1024 )) ;;
+            MemFree:)      MEM_FREE=$(( val * 1024 )) ;;
+            MemAvailable:) avail=$(( val * 1024 )) ;;
+            Buffers:)      buffers=$(( val * 1024 )) ;;
+            Cached:)       cached=$(( val * 1024 )) ;;
+            SReclaimable:) sreclaim=$(( val * 1024 )) ;;
+            SwapTotal:)    SWAP_TOTAL=$(( val * 1024 )) ;;
+            SwapFree:)     SWAP_FREE=$(( val * 1024 )) ;;
+        esac
+    done < /proc/meminfo
+    MEM_CACHED=$(( buffers + cached + sreclaim ))
+    MEM_AVAILABLE=${avail:-$(( MEM_FREE + MEM_CACHED ))}
+    (( MEM_AVAILABLE > MEM_TOTAL )) && MEM_AVAILABLE=$MEM_TOTAL
+    MEM_USED=$(( MEM_TOTAL - MEM_AVAILABLE ))
+    pct_x10 "$MEM_USED" "$MEM_TOTAL"
+    MEM_PCT_X10=$REPLY
+    SWAP_USED=$(( SWAP_TOTAL - SWAP_FREE ))
+    (( SWAP_USED < 0 )) && SWAP_USED=0
+    pct_x10 "$SWAP_USED" "$SWAP_TOTAL"
+    SWAP_PCT_X10=$REPLY
+}
+
+# ============================================================================
+# STORAGE
+# ============================================================================
+readonly FS_SEP=$'\x1f'
+ROOT_SRC="" ROOT_FSTYPE="" ROOT_SIZE=0 ROOT_USED=0 ROOT_AVAIL=0 ROOT_PCT_X10=0 ROOT_MAJMIN=""
+ROOT_KIND="" ROOT_MODEL="" ROOT_LAYOUT=""
+FS_LIST=()             # non-root filesystems: mount<US>type<US>size<US>used<US>avail<US>pct_x10<US>source
+DISK_WORST_PCT_X10=0 DISK_WORST_MOUNT="/"
+RESOLVED_DISKS=() RESOLVED_RAID="" RESOLVED_LVM=0 RESOLVED_CRYPT=0
+
+get_disk_info() {
+    local out src type size used avail mnt entry
+    local -a f
+    local -A seen=() ro=()
+    FS_LIST=()
+    ROOT_SRC="" ROOT_FSTYPE="" ROOT_SIZE=0 ROOT_USED=0 ROOT_AVAIL=0 ROOT_PCT_X10=0 ROOT_MAJMIN=""
+    if [[ -r /proc/self/mountinfo ]]; then
+        while read -r -a f; do
+            [[ ${f[4]} == / ]] && ROOT_MAJMIN=${f[2]}
+            if [[ ${f[5]} == ro || ${f[5]} == ro,* ]]; then ro[${f[4]}]=1; else ro[${f[4]}]=0; fi
+        done < /proc/self/mountinfo
+    fi
+    have df || return 1
+    # -l: local filesystems only (a stale NFS mount can never hang serverinfo)
+    out=$(run_timeout 5 df -PTlB1 2>/dev/null)
+    while read -r src type size used avail _ mnt; do
+        if ! is_uint "$size" || ! is_uint "$used" || ! is_uint "$avail" || (( size == 0 )); then
+            continue
+        fi
+        clean "$src"; src=$REPLY
+        clean "$mnt"; mnt=$REPLY
+        if [[ $mnt == / ]]; then
+            ROOT_SRC=$src ROOT_FSTYPE=$type ROOT_SIZE=$size ROOT_USED=$used ROOT_AVAIL=$avail
+            pct_x10 "$used" $(( used + avail ))
+            ROOT_PCT_X10=$REPLY
+            continue
+        fi
+        case $type in
+            tmpfs|devtmpfs|overlay|squashfs|efivarfs|ramfs|nsfs|autofs|iso9660|udf|fuse.lxcfs|fuse.snapfuse) continue ;;
+        esac
+        case $mnt in
+            /snap/*|/var/lib/docker/*|/var/lib/containers/*|/run/*|/proc/*|/sys/*|/dev/*) continue ;;
+        esac
+        # read-only mounts cannot fill up; bind mounts / btrfs subvolumes are duplicates
+        [[ ${ro[$mnt]:-0} == 1 ]] && continue
+        [[ $src == /* && -n ${seen[$src]:-} ]] && continue
+        seen[$src]=1
+        pct_x10 "$used" $(( used + avail ))
+        FS_LIST+=("$mnt$FS_SEP$type$FS_SEP$size$FS_SEP$used$FS_SEP$avail$FS_SEP$REPLY$FS_SEP$src")
+    done <<< "$out"
+
+    DISK_WORST_PCT_X10=$ROOT_PCT_X10 DISK_WORST_MOUNT="/"
+    local -a f
+    for entry in "${FS_LIST[@]}"; do
+        IFS=$FS_SEP read -r -a f <<< "$entry"
+        if (( f[5] > DISK_WORST_PCT_X10 )); then
+            DISK_WORST_PCT_X10=${f[5]}
+            DISK_WORST_MOUNT=${f[0]}
+        fi
+    done
+    get_root_device_kind
+}
+
+# resolve_physical_disks NAME DEPTH - walk dm/md/partition layers down to disks
+resolve_physical_disks() {
+    local n=$1 depth=$2 s real parent lvl uuid x
+    local sys=/sys/class/block/$n
+    (( depth > 8 )) && return
+    [[ -e $sys ]] || return
+    local -a slaves=("$sys"/slaves/*)
+    if (( ${#slaves[@]} > 0 )); then
+        if [[ $n == md* ]] && read_first lvl "$sys/md/level"; then
+            [[ -z $RESOLVED_RAID ]] && RESOLVED_RAID=${lvl^^}
+        elif [[ $n == dm-* ]] && read_first uuid "$sys/dm/uuid"; then
+            case $uuid in
+                LVM-*) RESOLVED_LVM=1 ;;
+                CRYPT-*) RESOLVED_CRYPT=1 ;;
+            esac
+        fi
+        for s in "${slaves[@]}"; do
+            resolve_physical_disks "${s##*/}" $(( depth + 1 ))
+        done
+        return
+    fi
+    if [[ -e $sys/partition ]]; then
+        real=$(readlink -f "$sys" 2>/dev/null)
+        parent=${real%/*}
+        parent=${parent##*/}
+        [[ -n $parent && -e /sys/block/$parent ]] && n=$parent
+    fi
+    [[ -e /sys/block/$n ]] || return
+    for x in "${RESOLVED_DISKS[@]}"; do
+        [[ $x == "$n" ]] && return
+    done
+    RESOLVED_DISKS+=("$n")
+}
+
+# get_root_device_kind - NVMe SSD / SSD / HDD / Virtual Disk (+ RAID/LVM layout)
+get_root_device_kind() {
+    local majmin=$ROOT_MAJMIN name="" real d rota model nvme=0 ssd=0 hdd=0 virt=0 virt_ssd=0 n
+    local -a layout=()
+    ROOT_KIND="" ROOT_MODEL="" ROOT_LAYOUT=""
+    RESOLVED_DISKS=() RESOLVED_RAID="" RESOLVED_LVM=0 RESOLVED_CRYPT=0
+    if [[ -n $majmin && -e /sys/dev/block/$majmin ]]; then
+        real=$(readlink -f "/sys/dev/block/$majmin" 2>/dev/null)
+        name=${real##*/}
+    elif [[ $ROOT_SRC == /dev/* ]]; then
+        real=$(readlink -f "$ROOT_SRC" 2>/dev/null)
+        name=${real##*/}
+    fi
+    [[ -n $name ]] && resolve_physical_disks "$name" 0
+
+    n=${#RESOLVED_DISKS[@]}
+    if (( n == 0 )); then
+        case $ROOT_FSTYPE in
+            overlay) ROOT_KIND="Overlay (container)" ;;
+            zfs) ROOT_KIND="ZFS pool" ;;
+            btrfs) ROOT_KIND="Btrfs volume" ;;
+            nfs*|cifs|ceph|glusterfs) ROOT_KIND="Network storage" ;;
+            *) ROOT_KIND="N/A" ;;
+        esac
+        return
+    fi
+    for d in "${RESOLVED_DISKS[@]}"; do
+        rota=1
+        read_first rota "/sys/block/$d/queue/rotational"
+        model=""
+        read_first model "/sys/block/$d/device/model"
+        clean "$model"
+        model=$REPLY
+        [[ -z $ROOT_MODEL && -n $model ]] && ROOT_MODEL=$model
+        case ${model,,} in
+            *qemu*|*vbox*|*virtual*|*vmware*|*msft*|*"elastic block store"*|*persistentdisk*)
+                virt=$(( virt + 1 )); [[ $rota == 0 ]] && virt_ssd=$(( virt_ssd + 1 )); continue ;;
+        esac
+        case $d in
+            nvme*) nvme=$(( nvme + 1 )) ;;
+            vd*|xvd*) virt=$(( virt + 1 )); [[ $rota == 0 ]] && virt_ssd=$(( virt_ssd + 1 )) ;;
+            *)
+                if [[ $rota == 0 ]]; then
+                    ssd=$(( ssd + 1 ))
+                elif is_virtual_machine; then
+                    virt=$(( virt + 1 ))   # hypervisors report rotational=1 by default
+                else
+                    hdd=$(( hdd + 1 ))
+                fi
+                ;;
+        esac
+    done
+    if (( nvme == n )); then ROOT_KIND="NVMe SSD"
+    elif (( ssd == n )); then ROOT_KIND="SSD"
+    elif (( hdd == n )); then ROOT_KIND="HDD"
+    elif (( virt == n && virt_ssd == n )); then ROOT_KIND="Virtual SSD"
+    elif (( virt == n )); then ROOT_KIND="Virtual Disk"
+    else
+        local -a kinds=()
+        (( nvme )) && kinds+=("NVMe")
+        (( ssd )) && kinds+=("SSD")
+        (( hdd )) && kinds+=("HDD")
+        (( virt )) && kinds+=("Virtual")
+        ROOT_KIND="Mixed (${kinds[*]})"
+        ROOT_KIND=${ROOT_KIND// /+}
+        ROOT_KIND=${ROOT_KIND/Mixed+/Mixed }
+    fi
+    [[ -n $RESOLVED_RAID ]] && layout+=("$RESOLVED_RAID")
+    (( n > 1 )) && layout+=("$n disks")
+    (( RESOLVED_LVM )) && layout+=("LVM")
+    (( RESOLVED_CRYPT )) && layout+=("LUKS")
+    local IFS=$'\x1e'
+    ROOT_LAYOUT="${layout[*]}"
+    ROOT_LAYOUT=${ROOT_LAYOUT//$'\x1e'/ · }
+}
+
+# mount_of PATH -> REPLY (longest mount point prefix among known filesystems)
+mount_of() {
+    local path=$1 best="/" entry m
+    for entry in "${FS_LIST[@]}"; do
+        m=${entry%%"$FS_SEP"*}
+        if [[ $path == "$m" || $path == "$m"/* ]] && (( ${#m} > ${#best} )); then
+            best=$m
+        fi
+    done
+    REPLY=$best
+}
+
+# fs_usage_of PATH -> REPLY ("33.0% used · 1.2 TiB free (/var/lib/pterodactyl)")
+fs_usage_of() {
+    local m entry f_m f_a f_p
+    mount_of "$1"
+    m=$REPLY
+    f_a=$ROOT_AVAIL f_p=$ROOT_PCT_X10
+    for entry in "${FS_LIST[@]}"; do
+        IFS=$FS_SEP read -r f_m _ _ _ f_a f_p _ <<< "$entry"
+        [[ $f_m == "$m" ]] && break
+        f_a=$ROOT_AVAIL f_p=$ROOT_PCT_X10
+    done
+    human_bytes "$f_a"
+    local free=$REPLY
+    fmt_x10 "$f_p"
+    REPLY="$REPLY% used · $free free ($m)"
+}
+
+# ============================================================================
+# NETWORK
+# ============================================================================
+NET_IFACE="" NET_IPV4="" NET_IPV4_EXTRA=0 NET_IPV6="" NET_PUBLIC_IP="" NET_PUBLIC_SRC=""
+NET_GATEWAY="" NET_STATE="" NET_SPEED="" NET_MTU="" NET_RX=0 NET_TX=0 NET_DNS=""
+NET_IPV4_CIDR="" NET_IPV4_ALL=() NET_DNS_LIST=()
+NET_OTHER=()            # name<US>state<US>ipv4
+declare -A NET_V4_FIRST=() NET_V4_LIST=()
+
+# hex_to_ipv4 HEX (little-endian, /proc/net/route) -> REPLY
+hex_to_ipv4() {
+    [[ $1 =~ ^[0-9A-Fa-f]{8}$ ]] || return 1
+    local h=$1
+    REPLY="$(( 16#${h:6:2} )).$(( 16#${h:4:2} )).$(( 16#${h:2:2} )).$(( 16#${h:0:2} ))"
+}
+
+# format_ipv6 HEX32 -> REPLY (RFC 5952 compressed notation)
+format_ipv6() {
+    local h=$1 i g best_s=-1 best_l=0 cur_s=-1 cur_l=0 left="" right=""
+    local -a gr=()
+    [[ $h =~ ^[0-9a-fA-F]{32}$ ]] || return 1
+    for (( i = 0; i < 32; i += 4 )); do
+        printf -v g '%x' $(( 16#${h:i:4} ))
+        gr+=("$g")
+    done
+    for (( i = 0; i < 8; i++ )); do
+        if [[ ${gr[i]} == 0 ]]; then
+            (( cur_s < 0 )) && cur_s=$i
+            cur_l=$(( cur_l + 1 ))
+            (( cur_l > best_l )) && { best_s=$cur_s; best_l=$cur_l; }
+        else
+            cur_s=-1 cur_l=0
+        fi
+    done
+    if (( best_l >= 2 )); then
+        for (( i = 0; i < best_s; i++ )); do left+="${left:+:}${gr[i]}"; done
+        for (( i = best_s + best_l; i < 8; i++ )); do right+="${right:+:}${gr[i]}"; done
+        REPLY="$left::$right"
+    else
+        local IFS=:
+        REPLY="${gr[*]}"
+    fi
+}
+
+is_public_ipv4() {
+    local a b c d
+    IFS=. read -r a b c d <<< "$1"
+    is_uint "$a" && is_uint "$b" && is_uint "$c" && is_uint "$d" || return 1
+    (( a == 0 || a == 10 || a == 127 || a >= 224 )) && return 1
+    (( a == 100 && b >= 64 && b <= 127 )) && return 1
+    (( a == 169 && b == 254 )) && return 1
+    (( a == 172 && b >= 16 && b <= 31 )) && return 1
+    (( a == 192 && b == 168 )) && return 1
+    (( a == 192 && b == 0 && (c == 0 || c == 2) )) && return 1
+    (( a == 198 && (b == 18 || b == 19) )) && return 1
+    (( a == 198 && b == 51 && c == 100 )) && return 1
+    (( a == 203 && b == 0 && c == 113 )) && return 1
+    return 0
+}
+
+get_network_info() {
+    local iface dest gw metric mask best=-1 dev st
+    NET_IFACE="" NET_GATEWAY=""
+    if [[ -r /proc/net/route ]]; then
+        while read -r iface dest gw _ _ _ metric mask _; do
+            [[ $dest == 00000000 && $mask == 00000000 ]] || continue
+            is_uint "$metric" || metric=0
+            if (( best < 0 || metric < best )); then
+                best=$metric NET_IFACE=$iface NET_GATEWAY=$gw
+            fi
+        done < /proc/net/route
+    fi
+    if [[ -n $NET_GATEWAY ]] && hex_to_ipv4 "$NET_GATEWAY" && [[ $REPLY != 0.0.0.0 ]]; then
+        NET_GATEWAY=$REPLY
+    else
+        NET_GATEWAY=""
+    fi
+    if [[ -z $NET_IFACE && -r /proc/net/ipv6_route ]]; then
+        local d6 p6 if6
+        while read -r d6 p6 _ _ _ _ _ _ _ if6; do
+            if [[ $d6 == 00000000000000000000000000000000 && $p6 == 00 && $if6 != lo ]]; then
+                NET_IFACE=$if6
+                break
+            fi
+        done < /proc/net/ipv6_route
+    fi
+    if [[ -z $NET_IFACE ]]; then
+        for dev in /sys/class/net/*; do
+            dev=${dev##*/}
+            case $dev in lo|docker*|veth*|br-*|pterodactyl*|virbr*|tun*|tap*|wg*) continue ;; esac
+            if read_first st "/sys/class/net/$dev/operstate" && [[ $st == up ]]; then
+                NET_IFACE=$dev
+                break
+            fi
+        done
+    fi
+
+    # IPv4 addresses of all interfaces with a single `ip` call
+    NET_V4_FIRST=() NET_V4_LIST=()
+    local fam addr
+    if have ip; then
+        while read -r _ dev fam addr _; do
+            [[ $fam == inet && $addr =~ ^[0-9.]+/[0-9]+$ ]] || continue
+            dev=${dev%%@*}
+            [[ -z ${NET_V4_FIRST[$dev]:-} ]] && NET_V4_FIRST[$dev]=$addr
+            NET_V4_LIST[$dev]+="$addr "
+        done < <(run_timeout 3 ip -4 -o addr show 2>/dev/null)
+    fi
+
+    [[ -n $NET_IFACE ]] || return 1
+    clean "$NET_IFACE"
+    NET_IFACE=$REPLY
+    local base=/sys/class/net/$NET_IFACE speed=""
+    NET_STATE="" NET_MTU="" NET_SPEED=""
+    read_first NET_STATE "$base/operstate"
+    read_first NET_MTU "$base/mtu"
+    if read_first speed "$base/speed" && is_uint "$speed" && (( speed > 0 )); then
+        if (( speed >= 1000 && speed % 1000 == 0 )); then
+            NET_SPEED="$(( speed / 1000 )) Gbit/s"
+        elif (( speed >= 1000 )); then
+            NET_SPEED="$(( speed / 1000 )).$(( speed % 1000 / 100 )) Gbit/s"
+        else
+            NET_SPEED="$speed Mbit/s"
+        fi
+    fi
+    read_first NET_RX "$base/statistics/rx_bytes" && is_uint "$NET_RX" || NET_RX=0
+    read_first NET_TX "$base/statistics/tx_bytes" && is_uint "$NET_TX" || NET_TX=0
+
+    local -a cidrs=()
+    read -r -a cidrs <<< "${NET_V4_LIST[$NET_IFACE]:-}"
+    if (( ${#cidrs[@]} == 0 )) && have hostname; then
+        # without iproute2: all non-loopback IPv4 addresses of the host
+        for addr in $(hostname -I 2>/dev/null); do
+            [[ $addr =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && cidrs+=("$addr")
+        done
+    fi
+    NET_IPV4_CIDR=${cidrs[0]:-}
+    NET_IPV4=${NET_IPV4_CIDR%/*}
+    NET_IPV4_ALL=("${cidrs[@]%/*}")
+    NET_IPV4_EXTRA=0
+    (( ${#cidrs[@]} > 1 )) && NET_IPV4_EXTRA=$(( ${#cidrs[@]} - 1 ))
+
+    # IPv6: first stable global address (skip temporary / deprecated)
+    local a plen scope fl name
+    NET_IPV6=""
+    if [[ -r /proc/net/if_inet6 ]]; then
+        while read -r a _ plen scope fl name; do
+            [[ $name == "$NET_IFACE" && $scope == 00 ]] || continue
+            (( 16#$fl & 0x21 )) && continue
+            format_ipv6 "$a" && { NET_IPV6="$REPLY/$(( 16#$plen ))"; break; }
+        done < /proc/net/if_inet6
+    fi
+    get_dns_servers
+    get_public_ip
+}
+
+get_dns_servers() {
+    local key val rest file=/etc/resolv.conf
+    local -a dns=()
+    if [[ -r /run/systemd/resolve/resolv.conf ]] && grep -q '^nameserver 127\.0\.0\.53' "$file" 2>/dev/null; then
+        file=/run/systemd/resolve/resolv.conf   # show real upstreams instead of the stub
+    fi
+    if [[ -r $file ]]; then
+        while read -r key val rest; do
+            [[ $key == nameserver && -n $val ]] && dns+=("$val")
+        done < "$file"
+    fi
+    NET_DNS_LIST=()
+    for key in "${dns[@]:0:3}"; do
+        clean "$key"
+        [[ -n $REPLY ]] && NET_DNS_LIST+=("$REPLY")
+    done
+    local IFS=,
+    NET_DNS="${NET_DNS_LIST[*]}"
+    NET_DNS=${NET_DNS//,/, }
+}
+
+get_public_ip() {
+    local ip out
+    NET_PUBLIC_IP="" NET_PUBLIC_SRC=""
+    for ip in "${NET_IPV4_ALL[@]}"; do
+        if is_public_ipv4 "$ip"; then
+            NET_PUBLIC_IP=$ip NET_PUBLIC_SRC="interface"
+            return 0
+        fi
+    done
+    [[ $CFG_PUBLIC_IP_LOOKUP == yes ]] && have curl || return 1
+    out=$(run_timeout 5 curl -fsS --max-time 3 --connect-timeout 2 --proto '=https' "$CFG_PUBLIC_IP_URL" 2>/dev/null) || return 1
+    trim "$out"
+    if [[ $REPLY =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        NET_PUBLIC_IP=$REPLY NET_PUBLIC_SRC="lookup"
+    fi
+}
+
+get_other_interfaces() {
+    local dev st
+    NET_OTHER=()
+    for dev in /sys/class/net/*; do
+        dev=${dev##*/}
+        [[ $dev == lo || $dev == veth* || $dev == "$NET_IFACE" ]] && continue
+        st=""
+        read_first st "/sys/class/net/$dev/operstate"
+        clean "$dev"
+        NET_OTHER+=("$REPLY$FS_SEP${st:-unknown}$FS_SEP${NET_V4_FIRST[$dev]:-}")
+    done
+}
+
+# ============================================================================
+# SERVICES (systemd with a process-table fallback)
+# ============================================================================
+HAVE_SYSTEMD=0
+declare -A SVC_LOAD=() SVC_ACTIVE=()
+
+# query_services UNIT... - LoadState/ActiveState of all units in ONE systemctl call
+query_services() {
+    local -a units=("$@")
+    local line i=0 unit
+    SVC_LOAD=() SVC_ACTIVE=()
+    HAVE_SYSTEMD=0
+    [[ -d /run/systemd/system ]] && have systemctl && HAVE_SYSTEMD=1
+    (( HAVE_SYSTEMD )) || return 1
+    while IFS= read -r line; do
+        if [[ -z $line ]]; then
+            i=$(( i + 1 ))
+            continue
+        fi
+        unit=${units[i]:-}
+        [[ -n $unit ]] || continue
+        case ${line%%=*} in
+            LoadState) SVC_LOAD[$unit]=${line#*=} ;;
+            ActiveState) SVC_ACTIVE[$unit]=${line#*=} ;;
+        esac
+    done < <(run_timeout 3 systemctl show --no-pager -p LoadState -p ActiveState "${units[@]/%/.service}" 2>/dev/null)
+}
+
+process_running() {
+    local c comm
+    if have pgrep; then
+        pgrep -x "$1" >/dev/null 2>&1
+        return
+    fi
+    for c in /proc/[0-9]*/comm; do
+        read_first comm "$c" && [[ $comm == "$1" ]] && return 0
+    done
+    return 1
+}
+
+# service_state UNIT [PROCESS] -> REPLY: active | inactive | failed | activating | missing
+service_state() {
+    local unit=$1 proc=${2:-}
+    if (( HAVE_SYSTEMD )) && [[ -n ${SVC_LOAD[$unit]:-} && ${SVC_LOAD[$unit]} != not-found ]]; then
+        REPLY=${SVC_ACTIVE[$unit]:-inactive}
+        return 0
+    fi
+    if [[ -n $proc ]] && process_running "$proc"; then
+        REPLY=active
+    elif (( HAVE_SYSTEMD )); then
+        REPLY=missing
+    else
+        REPLY=inactive
+    fi
+}
+
+# ============================================================================
+# DOCKER
+# ============================================================================
+DOCKER_INSTALLED=0 DOCKER_ACCESS=0 DOCKER_STATE="NOT INSTALLED" DOCKER_VERSION=""
+DOCKER_CONTAINERS="" DOCKER_RUNNING="" DOCKER_PAUSED="" DOCKER_STOPPED="" DOCKER_IMAGES=""
+DOCKER_DRIVER="" DOCKER_ROOT=""
+
+get_docker_info() {
+    local out rc v
+    DOCKER_INSTALLED=0 DOCKER_ACCESS=0 DOCKER_STATE="NOT INSTALLED"
+    if ! have docker && ! have dockerd && [[ ${SVC_LOAD[docker]:-} != loaded ]]; then
+        return 0
+    fi
+    DOCKER_INSTALLED=1
+    DOCKER_STATE="STOPPED"
+    if have docker; then
+        out=$(run_timeout 6 docker info --format '{{.ServerVersion}}|{{.Containers}}|{{.ContainersRunning}}|{{.ContainersPaused}}|{{.ContainersStopped}}|{{.Images}}|{{.Driver}}|{{.DockerRootDir}}' 2>/dev/null)
+        rc=$?
+        if (( rc == 0 )); then
+            IFS='|' read -r DOCKER_VERSION DOCKER_CONTAINERS DOCKER_RUNNING DOCKER_PAUSED \
+                DOCKER_STOPPED DOCKER_IMAGES DOCKER_DRIVER DOCKER_ROOT <<< "$out"
+        fi
+        if (( rc == 0 )) && [[ -n $DOCKER_VERSION ]] && is_uint "$DOCKER_CONTAINERS"; then
+            DOCKER_ACCESS=1 DOCKER_STATE="RUNNING"
+            clean "$DOCKER_VERSION"; DOCKER_VERSION=$REPLY
+            clean "$DOCKER_DRIVER"; DOCKER_DRIVER=$REPLY
+            clean "$DOCKER_ROOT"; DOCKER_ROOT=$REPLY
+            return 0
+        fi
+        DOCKER_VERSION="" DOCKER_CONTAINERS="" DOCKER_RUNNING="" DOCKER_PAUSED=""
+        DOCKER_STOPPED="" DOCKER_IMAGES="" DOCKER_DRIVER="" DOCKER_ROOT=""
+        [[ -S /var/run/docker.sock && ! -w /var/run/docker.sock ]] && DOCKER_STATE="NO ACCESS"
+        v=$(run_timeout 3 docker --version 2>/dev/null)
+        [[ $v =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] && DOCKER_VERSION=${BASH_REMATCH[1]}
+    fi
+    if [[ $DOCKER_STATE != "NO ACCESS" ]]; then
+        service_state docker dockerd
+        [[ $REPLY == active ]] && DOCKER_STATE="UNKNOWN"   # daemon up but not answering
+    fi
+}
+
+# ============================================================================
+# PTERODACTYL (detection only - this tool never installs or changes anything)
+# ============================================================================
+PTERO_DETECTED=0
+PANEL_DETECTED=0 PANEL_PATH="" PANEL_VERSION="" PANEL_WEBSERVER="" PANEL_DB_OK=0
+PANEL_SERVERS="" PANEL_NODES="" PANEL_SUSPENDED="" PANEL_NODE_SERVERS=""
+WINGS_INSTALLED=0 WINGS_BIN="" WINGS_STATE="NOT INSTALLED" WINGS_VERSION=""
+WINGS_NODE_UUID="" WINGS_API_HOST="" WINGS_API_PORT="" WINGS_API_TLS="" WINGS_API_CERT=""
+WINGS_SFTP_PORT="" WINGS_ROOT_DIR="/var/lib/pterodactyl" WINGS_DATA_DIR="/var/lib/pterodactyl/volumes"
+PTERO_SERVERS="" PTERO_ONLINE="" PTERO_OFFLINE="" PTERO_STARTING="" PTERO_SUSPENDED=""
+PTERO_SOURCE="" PTERO_NOTE=""
+
+# yaml_get FILE KEY.PATH... -> "path<TAB>value" lines. Minimal indentation-based
+# reader, sufficient for Wings' config.yml (scalars only, lists are skipped).
+yaml_get() {
+    local file=$1
+    shift
+    awk -v want="$*" '
+        BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) wanted[w[i]] = 1 }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            if (line ~ /^[ \t]*#/ || line ~ /^[ \t]*$/ || line ~ /^[ \t]*-/) next
+            match(line, /^ */)
+            indent = RLENGTH
+            rest = substr(line, indent + 1)
+            if (rest !~ /^[A-Za-z0-9_.-]+[ \t]*:/) next
+            key = rest
+            sub(/[ \t]*:.*$/, "", key)
+            val = rest
+            sub(/^[^:]*:[ \t]*/, "", val)
+            while (depth > 0 && ind[depth] >= indent) depth--
+            depth++
+            ind[depth] = indent
+            keys[depth] = key
+            path = keys[1]
+            for (i = 2; i <= depth; i++) path = path "." keys[i]
+            if (!(path in wanted)) next
+            if (val ~ /^"/) { val = substr(val, 2); sub(/".*$/, "", val) }
+            else if (val ~ /^\047/) { val = substr(val, 2); sub(/\047.*$/, "", val) }
+            else { sub(/[ \t]+#.*$/, "", val); sub(/[ \t]+$/, "", val) }
+            print path "\t" val
+        }' "$file" 2>/dev/null
+}
+
+# read_dotenv FILE KEY -> REPLY  (Laravel .env; first definition wins, like phpdotenv)
+read_dotenv() {
+    local file=$1 key=$2 line val out="" i ch
+    REPLY=""
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%$'\r'}
+        [[ $line =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+        [[ ${BASH_REMATCH[2]} == "$key" ]] || continue
+        val=${BASH_REMATCH[3]}
+        if [[ $val == \"* ]]; then
+            val=${val:1}
+            for (( i = 0; i < ${#val}; i++ )); do
+                ch=${val:i:1}
+                if [[ $ch == \\ ]]; then
+                    i=$(( i + 1 ))
+                    out+=${val:i:1}
+                elif [[ $ch == \" ]]; then
+                    break
+                else
+                    out+=$ch
+                fi
+            done
+            val=$out
+        elif [[ $val == \'* ]]; then
+            val=${val:1}
+            val=${val%%\'*}
+        else
+            val=${val%%[[:space:]]#*}
+            trim "$val"
+            val=$REPLY
+        fi
+        REPLY=$val
+        return 0
+    done < "$file"
+    return 1
+}
+
+detect_pterodactyl() {
+    local dir c server path
+    local -a candidates=() confs=()
+    local -A from_web=()
+    PANEL_DETECTED=0 PANEL_PATH="" PANEL_VERSION="" PANEL_WEBSERVER=""
+    WINGS_INSTALLED=0 WINGS_BIN=""
+
+    # ---- Wings: binary, config or systemd unit ----
+    if have wings; then
+        WINGS_BIN=$(command -v wings)
+    elif [[ -x /usr/local/bin/wings ]]; then
+        WINGS_BIN=/usr/local/bin/wings
+    fi
+    if [[ -n $WINGS_BIN || -f $CFG_WINGS_CONFIG || ${SVC_LOAD[wings]:-} == loaded ]]; then
+        WINGS_INSTALLED=1
+    fi
+
+    # ---- Panel: known paths + web server document roots ending in /public ----
+    [[ -n $CFG_PANEL_DIR ]] && candidates+=("$CFG_PANEL_DIR")
+    candidates+=(/var/www/pterodactyl /var/www/html/pterodactyl /var/www/panel /var/www/html/panel /srv/pterodactyl /opt/pterodactyl)
+    for c in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf /etc/apache2/sites-enabled/*; do
+        [[ -f $c && -r $c ]] && confs+=("$c")
+    done
+    if (( ${#confs[@]} > 0 )); then
+        while IFS=$'\t' read -r server path; do
+            [[ $path == /* ]] || continue
+            candidates+=("$path")
+            [[ -z ${from_web[$path]:-} ]] && from_web[$path]=$server
+        done < <(awk '
+            FNR == 1 { srv = (FILENAME ~ /apache2/) ? "apache2" : "nginx" }
+            {
+                k = tolower($1)
+                if ((k == "root" || k == "documentroot") && NF >= 2) {
+                    p = $2
+                    gsub(/[";]/, "", p)
+                    if (p ~ /\/public\/?$/) { sub(/\/public\/?$/, "", p); print srv "\t" p }
+                }
+            }' "${confs[@]}" 2>/dev/null)
+    fi
+    for dir in "${candidates[@]}"; do
+        dir=${dir%/}
+        [[ -d $dir && -f $dir/artisan ]] || continue
+        if [[ -f $dir/config/pterodactyl.php ]] || grep -qs '"name": *"pterodactyl/panel"' "$dir/composer.json"; then
+            PANEL_DETECTED=1
+            clean "$dir"; PANEL_PATH=$REPLY
+            PANEL_WEBSERVER=${from_web[$dir]:-}
+            break
+        fi
+    done
+    if (( PANEL_DETECTED )) && [[ -r $PANEL_PATH/config/app.php ]]; then
+        local v
+        v=$(sed -n "s/.*'version'[[:space:]]*=>[[:space:]]*'\([^']*\)'.*/\1/p" "$PANEL_PATH/config/app.php" 2>/dev/null)
+        v=${v%%$'\n'*}
+        [[ $v =~ ^[A-Za-z0-9._-]{1,32}$ ]] && PANEL_VERSION=$v
+    fi
+    PTERO_DETECTED=0
+    (( PANEL_DETECTED || WINGS_INSTALLED )) && PTERO_DETECTED=1
+    return 0
+}
+
+# get_wings_status - power state via systemd (`systemctl is-active wings` semantics)
+get_wings_status() {
+    WINGS_STATE="NOT INSTALLED"
+    (( WINGS_INSTALLED )) || return 0
+    service_state wings wings
+    case $REPLY in
+        active|reloading) WINGS_STATE="ONLINE" ;;
+        activating) WINGS_STATE="STARTING" ;;
+        *) WINGS_STATE="OFFLINE" ;;
+    esac
+}
+
+# get_wings_details - version and non-secret config metadata (static, read once)
+get_wings_details() {
+    local out path val
+    WINGS_VERSION=""
+    (( WINGS_INSTALLED )) || return 0
+    if [[ -n $WINGS_BIN ]]; then
+        # `wings version` only prints the version and exits
+        out=$(run_timeout 3 "$WINGS_BIN" version </dev/null 2>/dev/null)
+        [[ $out =~ v?([0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*) ]] && WINGS_VERSION=${BASH_REMATCH[1]}
+    fi
+    # Non-secret metadata only (the token is read separately, right before use)
+    [[ -r $CFG_WINGS_CONFIG ]] || return 0
+    while IFS=$'\t' read -r path val; do
+        clean "$val"
+        val=$REPLY
+        case $path in
+            uuid) [[ $val =~ ^[0-9a-fA-F-]{36}$ ]] && WINGS_NODE_UUID=$val ;;
+            api.host) WINGS_API_HOST=$val ;;
+            api.port) is_uint "$val" && WINGS_API_PORT=$val ;;
+            api.ssl.enabled) WINGS_API_TLS=${val,,} ;;
+            api.ssl.cert) WINGS_API_CERT=$val ;;
+            system.root_directory) [[ $val == /* ]] && WINGS_ROOT_DIR=$val ;;
+            system.data) [[ $val == /* ]] && WINGS_DATA_DIR=$val ;;
+            system.sftp.bind_port) is_uint "$val" && WINGS_SFTP_PORT=$val ;;
+        esac
+    done < <(yaml_get "$CFG_WINGS_CONFIG" uuid api.host api.port api.ssl.enabled api.ssl.cert \
+        system.root_directory system.data system.sftp.bind_port)
+    [[ -n $WINGS_API_PORT ]] || WINGS_API_PORT=8080
+}
+
+# wings_listener_ok PORT IPV4 - true only when a ROOT-owned socket is listening on
+# PORT (wildcard or IPV4). Guards the Wings token against a rogue unprivileged
+# process that grabbed the port while Wings was down.
+wings_listener_ok() {
+    local port=$1 ip=$2 phex iphex a b c d f
+    local -a files=()
+    printf -v phex '%04X' "$port"
+    IFS=. read -r a b c d <<< "$ip"
+    printf -v iphex '%02X%02X%02X%02X' "$d" "$c" "$b" "$a"
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [[ -r $f ]] && files+=("$f")
+    done
+    (( ${#files[@]} > 0 )) || return 1
+    awk -v p="$phex" -v v4="$iphex" '
+        $4 == "0A" && $8 == 0 {
+            split($2, x, ":")
+            if (x[2] != p) next
+            if (x[1] == "00000000" || x[1] == v4 || x[1] == "00000000000000000000000000000000" ||
+                x[1] == "0000000000000000FFFF0000" v4) { found = 1; exit }
+        }
+        END { exit !found }' "${files[@]}" 2>/dev/null
+}
+
+# wings_tls_name CERT -> REPLY : a DNS name covered by the Wings certificate
+wings_tls_name() {
+    local cert=$1 out name=""
+    REPLY=""
+    if have openssl && [[ -r $cert ]]; then
+        out=$(run_timeout 3 openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null)
+        [[ $out =~ DNS:([A-Za-z0-9*.-]+) ]] && name=${BASH_REMATCH[1]}
+        if [[ -z $name ]]; then
+            out=$(run_timeout 3 openssl x509 -in "$cert" -noout -subject -nameopt multiline 2>/dev/null)
+            [[ $out =~ commonName[[:space:]]*=[[:space:]]*([A-Za-z0-9*.-]+) ]] && name=${BASH_REMATCH[1]}
+        fi
+    fi
+    if [[ -z $name && $cert =~ /live/([A-Za-z0-9.-]+)/[^/]+$ ]]; then
+        name=${BASH_REMATCH[1]}
+        [[ $name =~ ^(.+)-[0-9]{4}$ ]] && name=${BASH_REMATCH[1]}
+    fi
+    [[ $name == \*.* ]] && name="serverinfo.${name#\*.}"
+    [[ $name =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && $name == *.* ]] || return 1
+    REPLY=$name
+}
+
+# wings_api_request TOKEN URL [CURL ARGS...] -> stdout: "total running transitional suspended"
+# The token reaches curl only through stdin (--config -) and always over a direct
+# local connection (--noproxy: never through an HTTP(S)_PROXY). The raw response,
+# which contains server environment variables, is consumed by jq and never shown.
+wings_api_request() {
+    local token=$1 url=$2
+    shift 2
+    printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\n' "$token" \
+        | run_timeout 7 curl --config - -fsS --noproxy '*' --max-time 6 --connect-timeout 2 --proto '=http,https' "$@" "$url" 2>/dev/null \
+        | jq -r 'if type == "array" then [length,
+                    (map(select(.state == "running")) | length),
+                    (map(select(.state == "starting" or .state == "stopping")) | length),
+                    (map(select(.is_suspended == true)) | length)] | @tsv
+                 else empty end' 2>/dev/null
+}
+
+# wings_api_counts - live per-server power states from the local Wings API
+wings_api_counts() {
+    local host=${WINGS_API_HOST:-0.0.0.0} port=${WINGS_API_PORT:-8080} ip name url out path val token=""
+    local total running trans susp
+    local -a extra=()
+    [[ $CFG_WINGS_API == off || $WINGS_STATE != ONLINE ]] && return 1
+    [[ -r $CFG_WINGS_CONFIG ]] && have curl && have jq || return 1
+    case $host in
+        ""|0.0.0.0|::|"[::]"|127.0.0.1|localhost) ip=127.0.0.1 ;;
+        *) [[ $host =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1; ip=$host ;;
+    esac
+    wings_listener_ok "$port" "$ip" || return 1
+    if [[ $WINGS_API_TLS == true ]]; then
+        wings_tls_name "$WINGS_API_CERT" || return 1
+        name=$REPLY
+        url="https://$name:$port/api/servers"
+        extra=(--resolve "$name:$port:$ip")
+    else
+        url="http://$ip:$port/api/servers"
+    fi
+    while IFS=$'\t' read -r path val; do
+        [[ $path == token ]] && token=$val
+    done < <(yaml_get "$CFG_WINGS_CONFIG" token)
+    if ! [[ $token =~ ^[A-Za-z0-9._-]{16,512}$ ]]; then
+        token=""
+        return 1
+    fi
+    out=$(wings_api_request "$token" "$url" "${extra[@]}")
+    if [[ -z $out && $WINGS_API_TLS == true && -r $WINGS_API_CERT ]]; then
+        out=$(wings_api_request "$token" "$url" "${extra[@]}" --cacert "$WINGS_API_CERT")   # self-signed
+    fi
+    token=""
+    IFS=$'\t' read -r total running trans susp <<< "$out"
+    is_uint "$total" && is_uint "$running" && is_uint "$trans" && is_uint "$susp" || return 1
+    PTERO_SERVERS=$total PTERO_ONLINE=$running PTERO_STARTING=$trans PTERO_SUSPENDED=$susp
+    PTERO_OFFLINE=$(( total - running - trans ))
+    PTERO_SOURCE="Wings API"
+}
+
+# docker_ptero_counts - Wings server containers (labels set by Wings) merged with
+# the server list Wings persists every minute in states.json
+docker_ptero_counts() {
+    local out name status states content re
+    local -A servers=() running=()
+    (( DOCKER_ACCESS )) || return 1
+    out=$(run_timeout 6 docker ps -a --no-trunc \
+        --filter "label=Service=Pterodactyl" --filter "label=ContainerType=server_process" \
+        --format '{{.Names}}	{{.Status}}' 2>/dev/null) || return 1
+    while IFS=$'\t' read -r name status; do
+        [[ -n $name ]] || continue
+        name=${name#/}
+        servers[$name]=1
+        [[ $status == Up* && $status != *"(Paused)"* ]] && running[$name]=1
+    done <<< "$out"
+    states="$WINGS_ROOT_DIR/states.json"
+    if [[ -f $states && -r $states ]]; then
+        content=$(< "$states")
+        re='"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"[[:space:]]*:'
+        while [[ $content =~ $re ]]; do
+            servers[${BASH_REMATCH[1]}]=1
+            content=${content#*"${BASH_REMATCH[0]}"}
+        done
+    fi
+    PTERO_SERVERS=${#servers[@]} PTERO_ONLINE=${#running[@]} PTERO_STARTING="" PTERO_SUSPENDED=""
+    PTERO_OFFLINE=$(( PTERO_SERVERS - PTERO_ONLINE ))
+    PTERO_SOURCE="Docker"
+}
+
+# panel_db_counts - server/node totals from the panel database (read-only COUNT
+# queries). Credentials are parsed from .env, validated, and passed to the
+# client through an anonymous pipe (fd 3) - never argv, env or output.
+panel_db_counts() {
+    local env_file="$PANEL_PATH/.env" client="" conn host port db user pass prefix q out
+    local a b c d
+    [[ $CFG_PANEL_DATABASE == off ]] && return 1
+    [[ -f $env_file && -r $env_file ]] || return 1
+    if have mariadb; then client=mariadb; elif have mysql; then client=mysql; else return 1; fi
+    read_dotenv "$env_file" DB_CONNECTION; conn=${REPLY:-mysql}
+    [[ $conn == mysql || $conn == mariadb ]] || return 1
+    read_dotenv "$env_file" DB_HOST;     host=${REPLY:-127.0.0.1}
+    read_dotenv "$env_file" DB_PORT;     port=${REPLY:-3306}
+    read_dotenv "$env_file" DB_DATABASE; db=${REPLY:-panel}
+    read_dotenv "$env_file" DB_USERNAME; user=${REPLY:-pterodactyl}
+    read_dotenv "$env_file" DB_PASSWORD; pass=$REPLY
+    read_dotenv "$env_file" DB_PREFIX;   prefix=$REPLY
+    REPLY=""
+    if ! [[ $host =~ ^[A-Za-z0-9._:-]+$ && $port =~ ^[0-9]{1,5}$ && $db =~ ^[A-Za-z0-9_$-]+$ && $prefix =~ ^[A-Za-z0-9_]*$ ]] \
+        || [[ $user == *[$'\n\r']* || $pass == *[$'\n\r']* ]]; then
+        pass=""
+        return 1
+    fi
+    user=${user//\\/\\\\}; user=${user//\"/\\\"}
+    pass=${pass//\\/\\\\}; pass=${pass//\"/\\\"}
+    q="SELECT (SELECT COUNT(*) FROM \`${prefix}servers\`), (SELECT COUNT(*) FROM \`${prefix}nodes\`),"
+    q+=" (SELECT COUNT(*) FROM \`${prefix}servers\` WHERE status = 'suspended'),"
+    if [[ -n $WINGS_NODE_UUID ]]; then
+        q+=" (SELECT COUNT(*) FROM \`${prefix}servers\` s JOIN \`${prefix}nodes\` n ON n.id = s.node_id WHERE n.uuid = '$WINGS_NODE_UUID')"
+    else
+        q+=" NULL"
+    fi
+    out=$(run_timeout 6 "$client" --defaults-extra-file=/dev/fd/3 --connect-timeout=3 -N -B -s -e "$q" "$db" 3< <(
+        printf '[client]\nuser="%s"\npassword="%s"\nhost="%s"\nport=%s\n' "$user" "$pass" "$host" "$port"
+    ) 2>/dev/null)
+    pass="" user=""
+    IFS=$'\t' read -r a b c d <<< "$out"
+    is_uint "$a" && is_uint "$b" && is_uint "$c" || return 1
+    PANEL_SERVERS=$a PANEL_NODES=$b PANEL_SUSPENDED=$c PANEL_NODE_SERVERS=""
+    is_uint "$d" && PANEL_NODE_SERVERS=$d
+    PANEL_DB_OK=1
+}
+
+# get_pterodactyl_info [refresh] - "refresh" skips the static detection (live mode)
+get_pterodactyl_info() {
+    PTERO_SERVERS="" PTERO_ONLINE="" PTERO_OFFLINE="" PTERO_STARTING="" PTERO_SUSPENDED=""
+    PTERO_SOURCE="" PTERO_NOTE="" PANEL_DB_OK=0 PANEL_NODE_SERVERS=""
+    if [[ ${1:-} != refresh ]]; then
+        detect_pterodactyl
+        get_wings_details
+    fi
+    get_wings_status
+    (( PTERO_DETECTED )) || return 0
+    (( PANEL_DETECTED )) && panel_db_counts
+
+    if (( WINGS_INSTALLED )); then
+        # Priority: live Wings API -> Docker containers (+ panel DB total) -> N/A
+        if ! wings_api_counts && docker_ptero_counts; then
+            if [[ -n $PANEL_NODE_SERVERS ]] && (( PANEL_NODE_SERVERS >= PTERO_ONLINE )); then
+                PTERO_SERVERS=$PANEL_NODE_SERVERS
+                PTERO_OFFLINE=$(( PTERO_SERVERS - PTERO_ONLINE ))
+                PTERO_SOURCE="Docker + Panel DB"
+            fi
+        fi
+        if [[ -z $PTERO_SOURCE ]]; then
+            if (( EUID != 0 )); then
+                PTERO_NOTE="run as root to count servers"
+            elif (( ! DOCKER_ACCESS )); then
+                PTERO_NOTE="Wings API and Docker unavailable"
+            fi
+        fi
+    elif (( PANEL_DB_OK )); then
+        # Panel-only host: totals come from the database; power state lives on the nodes
+        PTERO_SERVERS=$PANEL_SERVERS PTERO_SUSPENDED=$PANEL_SUSPENDED
+        PTERO_SOURCE="Panel DB"
+        PTERO_NOTE="power state is tracked by the Wings nodes"
+    elif (( EUID != 0 )); then
+        PTERO_NOTE="run as root to count servers"
+    fi
+}
+
+# ============================================================================
+# HEALTH
+# ============================================================================
+HEALTH_CPU="" HEALTH_RAM="" HEALTH_DISK="" HEALTH_WINGS="" HEALTH_DOCKER=""
+HEALTH_PTERO="" HEALTH_OVERALL=""
+
+# threshold_state PCT_X10 WARN CRIT CRIT_WORD -> REPLY
+threshold_state() {
+    if (( $1 >= $3 * 10 )); then
+        REPLY=$4
+    elif (( $1 >= $2 * 10 )); then
+        REPLY=WARNING
+    else
+        REPLY=HEALTHY
+    fi
+}
+
+get_health_status() {
+    local level=0 s
+    threshold_state "${CPU_USAGE_X10:-0}" "$CFG_CPU_WARN" "$CFG_CPU_CRIT" HIGH
+    HEALTH_CPU=$REPLY
+    threshold_state "$MEM_PCT_X10" "$CFG_RAM_WARN" "$CFG_RAM_CRIT" CRITICAL
+    HEALTH_RAM=$REPLY
+    threshold_state "$DISK_WORST_PCT_X10" "$CFG_DISK_WARN" "$CFG_DISK_CRIT" CRITICAL
+    HEALTH_DISK=$REPLY
+    HEALTH_WINGS=$WINGS_STATE
+    HEALTH_DOCKER=$DOCKER_STATE
+    if (( PTERO_DETECTED )); then HEALTH_PTERO="DETECTED"; else HEALTH_PTERO="NOT DETECTED"; fi
+
+    for s in "$HEALTH_CPU" "$HEALTH_RAM" "$HEALTH_DISK"; do
+        case $s in
+            WARNING) (( level < 1 )) && level=1 ;;
+            HIGH|CRITICAL) level=2 ;;
+        esac
+    done
+    [[ $WINGS_STATE == OFFLINE ]] && level=2
+    if (( WINGS_INSTALLED )); then
+        case $DOCKER_STATE in
+            STOPPED|UNKNOWN) level=2 ;;
+            "NOT INSTALLED") level=2 ;;
+        esac
+    fi
+    case $level in
+        0) HEALTH_OVERALL="HEALTHY" ;;
+        1) HEALTH_OVERALL="WARNING" ;;
+        *) HEALTH_OVERALL="CRITICAL" ;;
+    esac
+}
+
+# ============================================================================
+# RENDERING
+# ============================================================================
+# pad TEXT WIDTH -> REPLY (character-aware right padding)
+pad() {
+    local n=$(( $2 - ${#1} ))
+    (( n < 0 )) && n=0
+    printf -v REPLY '%s%*s' "$1" "$n" ''
+}
+
+# load_color LOAD -> REPLY (color by load per logical CPU)
+load_color() {
+    local l=$1 whole frac per
+    whole=${l%%.*} frac=${l#*.}
+    [[ $l == *.* ]] || frac=0
+    frac=${frac:0:2}
+    while (( ${#frac} < 2 )); do frac="${frac}0"; done
+    if ! is_uint "$whole" || ! is_uint "$frac"; then
+        REPLY=$C_WHITE
+        return
+    fi
+    per=$(( (10#$whole * 100 + 10#$frac) / ${CPU_THREADS:-1} ))
+    if (( per >= 100 )); then REPLY=$C_RED; elif (( per >= 70 )); then REPLY=$C_YELLOW; else REPLY=$C_GREEN; fi
+}
+
+# temp_value CELSIUS -> REPLY (colored "52°C" or N/A)
+temp_value() {
+    if ! is_uint "$1"; then
+        REPLY="${C_GRAY}N/A${C_RST}"
+        return
+    fi
+    local c=$C_GREEN
+    (( $1 >= 70 )) && c=$C_YELLOW
+    (( $1 >= 85 )) && c=$C_RED
+    REPLY="$c$1°C$C_RST"
+}
+
+print_header() {
+    local l1 l2
+    format_duration "$SYS_UPTIME_S" short
+    l1="$SYS_HOSTNAME  ·  $SYS_OS_SHORT"
+    l2="up $REPLY  ·  $SYS_DATETIME"
+    if [[ $1 == full ]]; then
+        print_logo
+        print_box "$l1" "$C_BOLD$C_WHITE$SYS_HOSTNAME$C_RST  $C_GRAY·$C_RST  $C_CYAN$SYS_OS_SHORT$C_RST" \
+                  "$l2" "$C_GRAY$l2$C_RST"
+    else
+        print_box "ELITEHOST SERVERINFO" "$C_BOLD${C_BRAND}ELITEHOST$C_RST $C_BOLD${C_WHITE}SERVERINFO$C_RST" \
+                  "$l1" "$C_GRAY$l1$C_RST"
+    fi
+}
+
+print_footer() {
+    local now el right left="EliteHost • Server Infrastructure" gap
+    now=${EPOCHREALTIME//[!0-9]/}
+    el=$(( (now - SI_START_US) / 10000 ))
+    printf -v right 'v%s · %d.%02ds' "$SI_VERSION" $(( el / 100 )) $(( el % 100 ))
+    gap=$(( W - ${#left} - ${#right} ))
+    (( gap < 2 )) && gap=2
+    printf '\n %s%sEliteHost%s %s•%s %sServer Infrastructure%s%*s%s%s%s\n\n' \
+        "$C_BOLD" "$C_BRAND" "$C_RST" "$C_GRAY" "$C_RST" "$C_WHITE" "$C_RST" "$gap" '' "$C_GRAY" "$right" "$C_RST"
+}
+
+render_system() {
+    print_section "SYSTEM"
+    print_kv "OS" "$SYS_OS"
+    [[ -n $SYS_DEBIAN_VERSION ]] && print_kv "Debian Version" "$SYS_DEBIAN_VERSION"
+    print_kv "Kernel" "${SYS_KERNEL:-N/A}"
+    print_kv "Architecture" "${SYS_ARCH:-N/A}"
+    print_kv "Hostname" "$SYS_HOSTNAME" "$C_CYAN"
+    format_duration "$SYS_UPTIME_S"
+    print_kv "Uptime" "$REPLY"
+    print_kv "Boot Time" "$SYS_BOOT_TIME"
+    print_kv "Date/Time" "$SYS_DATETIME"
+    print_kv "Timezone" "$SYS_TIMEZONE ($SYS_UTC_OFFSET)"
+    print_kv "Virtualization" "$SYS_VIRT_LABEL"
+    print_kv "Manufacturer" "${SYS_VENDOR:-N/A}"
+    print_kv "Model" "${SYS_MODEL:-N/A}"
+}
+
+render_cpu() {
+    local load="N/A"
+    print_section "CPU"
+    print_kv "Model" "$CPU_MODEL"
+    print_kv "Cores" "${CPU_CORES:-N/A}"
+    print_kv "Threads" "${CPU_THREADS:-N/A}"
+    is_uint "$CPU_SOCKETS" && (( CPU_SOCKETS > 1 )) && print_kv "Sockets" "$CPU_SOCKETS"
+    usage_value "${CPU_USAGE_X10:-0}" "$CFG_CPU_WARN" "$CFG_CPU_CRIT"
+    print_kv "Usage" "$REPLY" ""
+    if [[ -n $CPU_LOAD1 ]]; then
+        load_color "$CPU_LOAD1"
+        load="$REPLY$CPU_LOAD1$C_RST / $CPU_LOAD5 / $CPU_LOAD15  $C_GRAY(1/5/15 min)$C_RST"
+    fi
+    print_kv "Load Average" "$load"
+    format_mhz "$CPU_FREQ_MHZ"
+    print_kv "Frequency" "$REPLY"
+    format_mhz "$CPU_MAX_MHZ"
+    print_kv "Max Frequency" "$REPLY"
+    temp_value "$CPU_TEMP_C"
+    print_kv "Temperature" "$REPLY"
+    print_kv "Architecture" "${SYS_ARCH:-N/A}"
+    [[ -n $CPU_TASKS ]] && print_kv "Processes" "$CPU_TASKS total, $CPU_RUNNING running"
+}
+
+render_memory() {
+    local u
+    print_section "MEMORY"
+    human_bytes "$MEM_TOTAL";     print_kv "Total" "$REPLY"
+    human_bytes "$MEM_USED";      print_kv "Used" "$REPLY"
+    human_bytes "$MEM_AVAILABLE"; print_kv "Available" "$REPLY"
+    human_bytes "$MEM_FREE";      print_kv "Free" "$REPLY"
+    human_bytes "$MEM_CACHED";    print_kv "Cached" "$REPLY"
+    usage_value "$MEM_PCT_X10" "$CFG_RAM_WARN" "$CFG_RAM_CRIT"
+    print_kv "Usage" "$REPLY" ""
+    if (( SWAP_TOTAL > 0 )); then
+        human_bytes "$SWAP_TOTAL"; print_kv "Swap Total" "$REPLY"
+        human_bytes "$SWAP_USED"; u=$REPLY
+        fmt_x10 "$SWAP_PCT_X10"
+        print_kv "Swap Used" "$u ($REPLY%)"
+        human_bytes "$SWAP_FREE"; print_kv "Swap Free" "$REPLY"
+    else
+        print_kv "Swap" "Disabled" "$C_GRAY"
+    fi
+}
+
+render_storage() {
+    local dev=$ROOT_KIND entry m t s u a p src size used c
+    print_section "STORAGE"
+    [[ -n $ROOT_LAYOUT ]] && dev+=" · $ROOT_LAYOUT"
+    print_kv "Device" "${dev:-N/A}" "$C_CYAN"
+    [[ -n $ROOT_MODEL ]] && print_kv "Disk Model" "$ROOT_MODEL"
+    print_kv "Mount" "/"
+    print_kv "Filesystem" "${ROOT_FSTYPE:-N/A}${ROOT_SRC:+  $C_GRAY$ROOT_SRC$C_RST}"
+    human_bytes "$ROOT_SIZE";  print_kv "Total" "$REPLY"
+    human_bytes "$ROOT_USED";  print_kv "Used" "$REPLY"
+    human_bytes "$ROOT_AVAIL"; print_kv "Free" "$REPLY"
+    usage_value "$ROOT_PCT_X10" "$CFG_DISK_WARN" "$CFG_DISK_CRIT"
+    print_kv "Usage" "$REPLY" ""
+    (( ${#FS_LIST[@]} > 0 )) || return 0
+    printf '\n %s%-20s %-6s %9s %9s %6s%s\n' "$C_GRAY" "Mount" "Type" "Size" "Used" "Use%" "$C_RST"
+    for entry in "${FS_LIST[@]}"; do
+        IFS=$FS_SEP read -r m t s u a p src <<< "$entry"
+        (( ${#m} > 20 )) && m="...${m: -17}"
+        human_bytes "$s"; size=$REPLY
+        human_bytes "$u"; used=$REPLY
+        level_color "$p" "$CFG_DISK_WARN" "$CFG_DISK_CRIT"
+        c=$REPLY
+        fmt_x10 "$p"
+        printf ' %-20s %-6s %9s %9s %s%5s%%%s\n' "$m" "${t:0:6}" "$size" "$used" "$C_BOLD$c" "$REPLY" "$C_RST"
+    done
+}
+
+render_network() {
+    local detail=${1:-} v c entry name st ip
+    print_section "NETWORK"
+    if [[ -z $NET_IFACE ]]; then
+        print_kv "Status" "NO NETWORK" "$C_RED"
+        return 0
+    fi
+    print_kv "Interface" "$NET_IFACE" "$C_CYAN"
+    case ${NET_STATE,,} in up) c=$C_GREEN ;; down) c=$C_RED ;; *) c=$C_YELLOW ;; esac
+    print_kv "State" "${NET_STATE^^}" "$c$C_BOLD"
+    print_kv "Link Speed" "${NET_SPEED:-N/A}"
+    v=${NET_IPV4:-N/A}
+    (( NET_IPV4_EXTRA > 0 )) && v+="  $C_GRAY(+$NET_IPV4_EXTRA more)$C_RST"
+    print_kv "IPv4" "$v"
+    print_kv "IPv6" "${NET_IPV6:-N/A}"
+    if [[ -n $NET_PUBLIC_IP ]]; then
+        print_kv "Public IP" "$NET_PUBLIC_IP" "$C_CYAN"
+    elif [[ -n $NET_IPV4 ]]; then
+        print_kv "Public IP" "N/A  (private address / NAT)"
+    else
+        print_kv "Public IP" "N/A"
+    fi
+    print_kv "Gateway" "${NET_GATEWAY:-N/A}"
+    print_kv "DNS" "${NET_DNS:-N/A}"
+    human_bytes "$NET_RX"; print_kv "RX" "$REPLY"
+    human_bytes "$NET_TX"; print_kv "TX" "$REPLY"
+    [[ $detail == detail ]] || return 0
+    print_kv "MTU" "${NET_MTU:-N/A}"
+    if (( NET_IPV4_EXTRA > 0 )); then
+        local i shown=0
+        for (( i = 1; i < ${#NET_IPV4_ALL[@]}; i++ )); do
+            if (( shown == 8 )); then
+                print_kv "" "$C_GRAY(+$(( ${#NET_IPV4_ALL[@]} - 1 - shown )) more)$C_RST" ""
+                break
+            fi
+            if (( shown == 0 )); then print_kv "Extra IPv4" "${NET_IPV4_ALL[i]}"; else print_kv "" "${NET_IPV4_ALL[i]}"; fi
+            shown=$(( shown + 1 ))
+        done
+    fi
+    (( ${#NET_OTHER[@]} > 0 )) || return 0
+    printf '\n %s%-18s %-10s %s%s\n' "$C_GRAY" "Interface" "State" "IPv4" "$C_RST"
+    for entry in "${NET_OTHER[@]}"; do
+        IFS=$FS_SEP read -r name st ip <<< "$entry"
+        case $st in up) c=$C_GREEN ;; down) c=$C_RED ;; *) c=$C_GRAY ;; esac
+        printf ' %-18s %s%-10s%s %s\n' "${name:0:18}" "$c" "${st^^}" "$C_RST" "${ip:--}"
+    done
+}
+
+render_docker() {
+    print_section "DOCKER"
+    if (( ! DOCKER_INSTALLED )); then
+        print_kv "Docker" "NOT INSTALLED" "$C_GRAY"
+        return 0
+    fi
+    state_color "$DOCKER_STATE"
+    print_kv "Status" "$DOCKER_STATE" "$REPLY$C_BOLD"
+    print_kv "Version" "${DOCKER_VERSION:-N/A}"
+    if (( DOCKER_ACCESS )); then
+        print_kv "Containers" "$DOCKER_CONTAINERS"
+        print_kv "Running" "$DOCKER_RUNNING" "$C_GREEN"
+        print_kv "Stopped" "$DOCKER_STOPPED"
+        (( ${DOCKER_PAUSED:-0} > 0 )) && print_kv "Paused" "$DOCKER_PAUSED" "$C_YELLOW"
+        print_kv "Images" "$DOCKER_IMAGES"
+        print_kv "Storage Driver" "${DOCKER_DRIVER:-N/A}"
+        print_kv "Root Dir" "${DOCKER_ROOT:-N/A}"
+    elif [[ $DOCKER_STATE == "NO ACCESS" ]]; then
+        print_kv "Note" "run as root (or docker group) for details" "$C_GRAY"
+    fi
+}
+
+# web_service_label NAME -> REPLY ("nginx (active)")
+web_service_label() {
+    service_state "$1" "$1"
+    [[ $REPLY == missing ]] && REPLY=inactive
+    REPLY="$1 ($REPLY)"
+}
+
+render_pterodactyl() {
+    local v c
+    print_section "PTERODACTYL"
+    if (( ! PTERO_DETECTED )); then
+        print_kv "Status" "NOT DETECTED" "$C_GRAY"
+        return 0
+    fi
+    if (( PANEL_DETECTED )); then
+        print_kv "Panel" "$C_GREEN${C_BOLD}DETECTED$C_RST${PANEL_VERSION:+  ${C_GRAY}v$PANEL_VERSION$C_RST}" ""
+        print_kv "Panel Path" "$PANEL_PATH"
+        if [[ -n $PANEL_WEBSERVER ]]; then
+            web_service_label "$PANEL_WEBSERVER"
+            print_kv "Web Server" "$REPLY"
+        fi
+        service_state pteroq
+        [[ $REPLY != missing ]] && print_kv "Queue Worker" "pteroq ($REPLY)"
+    else
+        print_kv "Panel" "NOT DETECTED" "$C_GRAY"
+    fi
+    if (( WINGS_INSTALLED )); then
+        state_color "$WINGS_STATE"
+        print_kv "Wings" "$REPLY$C_BOLD$WINGS_STATE$C_RST${WINGS_VERSION:+  ${C_GRAY}v$WINGS_VERSION$C_RST}" ""
+        if [[ -r $CFG_WINGS_CONFIG ]]; then
+            v=":$WINGS_API_PORT"
+            [[ $WINGS_API_TLS == true ]] && v+=" (HTTPS)" || v+=" (HTTP)"
+            [[ -n $WINGS_SFTP_PORT ]] && v+="  ·  SFTP :$WINGS_SFTP_PORT"
+            print_kv "Wings API" "$v"
+        fi
+    else
+        print_kv "Wings" "NOT INSTALLED" "$C_GRAY"
+    fi
+    state_color "$DOCKER_STATE"
+    print_kv "Docker" "$DOCKER_STATE" "$REPLY$C_BOLD"
+    if (( WINGS_INSTALLED )); then
+        print_kv "Game Data" "$WINGS_DATA_DIR"
+        if (( ROOT_SIZE > 0 )); then
+            fs_usage_of "$WINGS_DATA_DIR"
+            print_kv "Data Disk" "$REPLY" "$C_GRAY"
+        fi
+    fi
+
+    print_kv "Servers" "${PTERO_SERVERS:-N/A}" "$C_BOLD$C_WHITE"
+    print_kv "Online" "${PTERO_ONLINE:-N/A}" "$C_GREEN"
+    c=$C_WHITE
+    [[ -n $PTERO_OFFLINE ]] && (( PTERO_OFFLINE > 0 )) && c=$C_RED
+    print_kv "Offline" "${PTERO_OFFLINE:-N/A}" "$c"
+    [[ -n $PTERO_STARTING ]] && (( PTERO_STARTING > 0 )) && print_kv "Starting" "$PTERO_STARTING" "$C_YELLOW"
+    [[ -n $PTERO_SUSPENDED ]] && (( PTERO_SUSPENDED > 0 )) && print_kv "Suspended" "$PTERO_SUSPENDED" "$C_YELLOW"
+    [[ -n $PTERO_SOURCE ]] && print_kv "Source" "$PTERO_SOURCE" "$C_GRAY"
+    [[ -n $PTERO_NOTE ]] && print_kv "Note" "$PTERO_NOTE" "$C_GRAY"
+    if (( PANEL_DB_OK && WINGS_INSTALLED )); then
+        print_kv "Panel Total" "$PANEL_SERVERS servers · $PANEL_NODES nodes"
+    elif (( PANEL_DB_OK )); then
+        print_kv "Nodes" "$PANEL_NODES"
+    fi
+}
+
+# status_line LABEL STATE [DETAIL]
+status_line() {
+    local color
+    if [[ -z ${3:-} ]]; then
+        print_status "$1" "$2"
+        return 0
+    fi
+    state_color "$2"
+    color=$REPLY
+    pad "$2" 10
+    printf ' %s●%s %-13s%s%s%s%s %s%s%s\n' "$color" "$C_RST" "$1" "$C_BOLD" "$color" "$REPLY" "$C_RST" "$C_GRAY" "$3" "$C_RST"
+}
+
+render_status() {
+    local d
+    print_section "STATUS"
+    fmt_x10 "${CPU_USAGE_X10:-0}";  status_line "CPU" "$HEALTH_CPU" "$REPLY%"
+    fmt_x10 "$MEM_PCT_X10";         status_line "RAM" "$HEALTH_RAM" "$REPLY%"
+    fmt_x10 "$DISK_WORST_PCT_X10";  status_line "STORAGE" "$HEALTH_DISK" "$REPLY% ($DISK_WORST_MOUNT)"
+    status_line "WINGS" "$HEALTH_WINGS"
+    status_line "DOCKER" "$HEALTH_DOCKER"
+    d=""
+    [[ -n $PTERO_SERVERS ]] && d="$PTERO_SERVERS servers${PTERO_ONLINE:+ · $PTERO_ONLINE online}"
+    status_line "PTERODACTYL" "$HEALTH_PTERO" "$d"
+    printf ' %s%s%s\n' "$C_GRAY" "${RULE:0:24}" "$C_RST"
+    status_line "OVERALL" "$HEALTH_OVERALL"
+}
+
+# ============================================================================
+# JSON OUTPUT (pretty-printed, never colored; unknown values are null)
+# ============================================================================
+J_OUT="" J_DEPTH=0 J_FIRST=1
+
+j_prefix() {
+    if (( J_DEPTH > 0 )); then
+        (( J_FIRST )) || J_OUT+=","
+        printf -v REPLY '\n%*s' $(( J_DEPTH * 2 )) ''
+        J_OUT+=$REPLY
+    fi
+    J_FIRST=0
+    if [[ -n $1 ]]; then
+        json_escape "$1"
+        J_OUT+="$REPLY: "
+    fi
+}
+j_open()      { j_prefix "$1"; J_OUT+='{'; J_DEPTH=$(( J_DEPTH + 1 )); J_FIRST=1; }
+j_open_arr()  { j_prefix "$1"; J_OUT+='['; J_DEPTH=$(( J_DEPTH + 1 )); J_FIRST=1; }
+j_end() {
+    J_DEPTH=$(( J_DEPTH - 1 ))
+    if (( ! J_FIRST )); then
+        printf -v REPLY '\n%*s' $(( J_DEPTH * 2 )) ''
+        J_OUT+=$REPLY
+    fi
+    J_OUT+=$1
+    J_FIRST=0
+}
+j_close()     { j_end '}'; }
+j_close_arr() { j_end ']'; }
+j_raw()  { j_prefix "$1"; J_OUT+=$2; }
+j_str()  { json_escape "$2"; j_raw "$1" "$REPLY"; }
+j_bool() { if (( ${2:-0} )); then j_raw "$1" true; else j_raw "$1" false; fi; }
+j_pct()  { fmt_x10 "${2:-0}"; j_raw "$1" "$REPLY"; }
+j_num() {
+    if [[ $2 =~ ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
+        j_raw "$1" "$2"
+    elif is_uint "$2"; then
+        j_raw "$1" $(( 10#$2 ))
+    else
+        j_raw "$1" null
+    fi
+}
+# j_bytes KEY BYTES - "<key>_bytes": number and "<key>": human readable
+j_bytes() {
+    j_num "${1}_bytes" "$2"
+    human_bytes "$2" || REPLY=""
+    j_str "$1" "$REPLY"
+}
+
+json_mode() {
+    local ts entry m t s u a p src name st ip dns
+    printf -v ts '%(%Y-%m-%dT%H:%M:%S%z)T' "$NOW_EPOCH"
+    ts="${ts:0:22}:${ts:22:2}"
+    J_OUT="" J_DEPTH=0 J_FIRST=1
+    j_open ""
+    j_open elitehost
+    j_str tool "serverinfo"
+    j_str name "$SI_NAME"
+    j_str version "$SI_VERSION"
+    j_str generated_at "$ts"
+    j_close
+
+    if want system; then
+        j_open system
+        j_str os "$SYS_OS"
+        j_str os_id "$SYS_OS_ID"
+        j_str version_id "$SYS_OS_VERSION_ID"
+        j_str debian_version "$SYS_DEBIAN_VERSION"
+        j_str codename "$SYS_CODENAME"
+        j_str kernel "$SYS_KERNEL"
+        j_str architecture "$SYS_ARCH"
+        j_str hostname "$SYS_HOSTNAME"
+        j_num uptime_seconds "$SYS_UPTIME_S"
+        format_duration "$SYS_UPTIME_S"
+        j_str uptime "$REPLY"
+        j_str boot_time "$SYS_BOOT_TIME"
+        j_str datetime "$SYS_DATETIME"
+        j_str timezone "$SYS_TIMEZONE"
+        j_str utc_offset "$SYS_UTC_OFFSET"
+        j_str virtualization "$SYS_VIRT"
+        j_str virtualization_label "$SYS_VIRT_LABEL"
+        j_str manufacturer "$SYS_VENDOR"
+        j_str model "$SYS_MODEL"
+        j_close
+    fi
+
+    if want cpu; then
+        j_open cpu
+        j_str model "$CPU_MODEL"
+        j_str vendor "$CPU_VENDOR"
+        j_str architecture "$SYS_ARCH"
+        j_num cores "$CPU_CORES"
+        j_num threads "$CPU_THREADS"
+        j_num sockets "$CPU_SOCKETS"
+        j_pct usage_percent "$CPU_USAGE_X10"
+        j_open_arr load_average
+        j_num "" "$CPU_LOAD1"
+        j_num "" "$CPU_LOAD5"
+        j_num "" "$CPU_LOAD15"
+        j_close_arr
+        j_num frequency_mhz "$CPU_FREQ_MHZ"
+        j_num max_frequency_mhz "$CPU_MAX_MHZ"
+        j_num temperature_c "$CPU_TEMP_C"
+        j_num processes "$CPU_TASKS"
+        j_num processes_running "$CPU_RUNNING"
+        j_close
+    fi
+
+    if want memory; then
+        j_open memory
+        j_bytes total "$MEM_TOTAL"
+        j_bytes used "$MEM_USED"
+        j_bytes available "$MEM_AVAILABLE"
+        j_bytes free "$MEM_FREE"
+        j_bytes cached "$MEM_CACHED"
+        j_pct usage_percent "$MEM_PCT_X10"
+        j_open swap
+        j_bytes total "$SWAP_TOTAL"
+        j_bytes used "$SWAP_USED"
+        j_bytes free "$SWAP_FREE"
+        j_pct usage_percent "$SWAP_PCT_X10"
+        j_close
+        j_close
+    fi
+
+    if want storage; then
+        j_open storage
+        j_str device_type "$ROOT_KIND"
+        j_str disk_model "$ROOT_MODEL"
+        j_str layout "$ROOT_LAYOUT"
+        j_str mount "/"
+        j_str filesystem "$ROOT_FSTYPE"
+        j_str source "$ROOT_SRC"
+        j_bytes total "$ROOT_SIZE"
+        j_bytes used "$ROOT_USED"
+        j_bytes free "$ROOT_AVAIL"
+        j_pct usage_percent "$ROOT_PCT_X10"
+        j_open_arr filesystems
+        for entry in "${FS_LIST[@]}"; do
+            IFS=$FS_SEP read -r m t s u a p src <<< "$entry"
+            j_open ""
+            j_str mount "$m"
+            j_str filesystem "$t"
+            j_str source "$src"
+            j_bytes total "$s"
+            j_bytes used "$u"
+            j_bytes free "$a"
+            j_pct usage_percent "$p"
+            j_close
+        done
+        j_close_arr
+        j_close
+    fi
+
+    if want network; then
+        j_open network
+        j_str interface "$NET_IFACE"
+        j_str state "$NET_STATE"
+        j_str link_speed "$NET_SPEED"
+        j_num mtu "$NET_MTU"
+        j_str ipv4 "$NET_IPV4"
+        j_str ipv4_cidr "$NET_IPV4_CIDR"
+        j_num ipv4_additional "$NET_IPV4_EXTRA"
+        j_str ipv6 "$NET_IPV6"
+        j_str public_ipv4 "$NET_PUBLIC_IP"
+        j_str public_ip_source "$NET_PUBLIC_SRC"
+        j_str gateway "$NET_GATEWAY"
+        j_open_arr ipv4_addresses
+        for ip in "${NET_IPV4_ALL[@]}"; do
+            j_str "" "$ip"
+        done
+        j_close_arr
+        j_open_arr dns
+        for dns in "${NET_DNS_LIST[@]}"; do
+            j_str "" "$dns"
+        done
+        j_close_arr
+        j_bytes rx "$NET_RX"
+        j_bytes tx "$NET_TX"
+        if [[ -z ${WANT[all]:-} ]]; then
+            j_open_arr other_interfaces
+            for entry in "${NET_OTHER[@]}"; do
+                IFS=$FS_SEP read -r name st ip <<< "$entry"
+                j_open ""
+                j_str name "$name"
+                j_str state "$st"
+                j_str ipv4 "$ip"
+                j_close
+            done
+            j_close_arr
+        fi
+        j_close
+    fi
+
+    if want docker; then
+        j_open docker
+        j_bool installed "$DOCKER_INSTALLED"
+        j_str status "$DOCKER_STATE"
+        j_str version "$DOCKER_VERSION"
+        j_num containers "$DOCKER_CONTAINERS"
+        j_num running "$DOCKER_RUNNING"
+        j_num stopped "$DOCKER_STOPPED"
+        j_num paused "$DOCKER_PAUSED"
+        j_num images "$DOCKER_IMAGES"
+        j_str storage_driver "$DOCKER_DRIVER"
+        j_str root_dir "$DOCKER_ROOT"
+        j_close
+    fi
+
+    if want pterodactyl; then
+        j_open pterodactyl
+        j_bool detected "$PTERO_DETECTED"
+        j_num servers "$PTERO_SERVERS"
+        j_num online "$PTERO_ONLINE"
+        j_num offline "$PTERO_OFFLINE"
+        j_num starting "$PTERO_STARTING"
+        j_num suspended "$PTERO_SUSPENDED"
+        j_str source "$PTERO_SOURCE"
+        j_str note "$PTERO_NOTE"
+        j_open panel
+        j_bool detected "$PANEL_DETECTED"
+        j_str path "$PANEL_PATH"
+        j_str version "$PANEL_VERSION"
+        j_str web_server "$PANEL_WEBSERVER"
+        j_bool database_connected "$PANEL_DB_OK"
+        j_num total_servers "$PANEL_SERVERS"
+        j_num nodes "$PANEL_NODES"
+        j_num suspended_servers "$PANEL_SUSPENDED"
+        j_close
+        j_open wings
+        j_bool installed "$WINGS_INSTALLED"
+        j_str status "$WINGS_STATE"
+        j_str version "$WINGS_VERSION"
+        j_num api_port "$WINGS_API_PORT"
+        case $WINGS_API_TLS in
+            true) j_raw api_tls true ;;
+            false) j_raw api_tls false ;;
+            *) j_raw api_tls null ;;
+        esac
+        j_num sftp_port "$WINGS_SFTP_PORT"
+        (( WINGS_INSTALLED )) && j_str data_dir "$WINGS_DATA_DIR"
+        j_close
+        j_close
+    fi
+
+    if want status; then
+        j_open health
+        j_str cpu "$HEALTH_CPU"
+        j_str ram "$HEALTH_RAM"
+        j_str storage "$HEALTH_DISK"
+        j_str storage_mount "$DISK_WORST_MOUNT"
+        j_str wings "$HEALTH_WINGS"
+        j_str docker "$HEALTH_DOCKER"
+        j_str pterodactyl "$HEALTH_PTERO"
+        j_str overall "$HEALTH_OVERALL"
+        j_close
+    fi
+    j_close
+    printf '%s\n' "$J_OUT"
+}
+
+# ============================================================================
+# LIVE MODE
+# ============================================================================
+LIVE_ACTIVE=0
+LIVE_BAR_W=24
+
+live_cleanup() {
+    (( LIVE_ACTIVE )) || return 0
+    LIVE_ACTIVE=0
+    printf '\e[0m\e[?25h\e[?1049l'
+}
+
+# live_bar LABEL PCT_X10 WARN CRIT DETAIL
+live_bar() {
+    local color bar
+    level_color "$2" "$3" "$4"
+    color=$REPLY
+    make_bar "$2" "$LIVE_BAR_W" "$color"
+    bar=$REPLY
+    fmt_x10 "$2"
+    printf ' %s%-5s%s %s %s%s%5s%%%s  %s%s%s\n' "$C_BOLD$C_WHITE" "$1" "$C_RST" "$bar" \
+        "$C_BOLD" "$color" "$REPLY" "$C_RST" "$C_GRAY" "$5" "$C_RST"
+}
+
+# live_cols KEY PLAIN COLORED [...] - aligned key/value columns (colors excluded from width)
+live_cols() {
+    local out="" n
+    while (( $# >= 3 )); do
+        pad "$1" 9
+        out+=" $C_GRAY$REPLY$C_RST"
+        n=$(( 17 - ${#2} ))
+        (( n < 1 )) && n=1
+        printf -v REPLY '%*s' "$n" ''
+        out+="$3$REPLY"
+        shift 3
+    done
+    printf '%s\n' "$out"
+}
+
+render_live_frame() {
+    local l1 u r c v1 v2 clock
+    format_duration "$SYS_UPTIME_S" short
+    l1="$SYS_HOSTNAME  ·  $SYS_OS_SHORT  ·  up $REPLY"
+    print_box "ELITEHOST SERVERINFO  ·  LIVE" \
+        "$C_BOLD${C_BRAND}ELITEHOST$C_RST $C_BOLD${C_WHITE}SERVERINFO$C_RST  $C_GRAY·$C_RST  $C_GREEN${C_BOLD}LIVE$C_RST" \
+        "$l1" "$C_GRAY$l1$C_RST"
+    echo
+    live_bar "CPU" "${CPU_USAGE_X10:-0}" "$CFG_CPU_WARN" "$CFG_CPU_CRIT" "${CPU_THREADS:-?} threads"
+    human_bytes "$MEM_USED"; u=$REPLY
+    human_bytes "$MEM_TOTAL"
+    live_bar "RAM" "$MEM_PCT_X10" "$CFG_RAM_WARN" "$CFG_RAM_CRIT" "$u / $REPLY"
+    if (( SWAP_TOTAL > 0 )); then
+        human_bytes "$SWAP_USED"; u=$REPLY
+        human_bytes "$SWAP_TOTAL"
+        live_bar "SWAP" "$SWAP_PCT_X10" "$CFG_RAM_WARN" "$CFG_RAM_CRIT" "$u / $REPLY"
+    fi
+    human_bytes "$ROOT_USED"; u=$REPLY
+    human_bytes "$ROOT_SIZE"
+    live_bar "DISK" "$ROOT_PCT_X10" "$CFG_DISK_WARN" "$CFG_DISK_CRIT" "$u / $REPLY"
+    echo
+    v1="$CPU_LOAD1 $CPU_LOAD5 $CPU_LOAD15"
+    load_color "${CPU_LOAD1:-0}"
+    c=$REPLY
+    temp_value "$CPU_TEMP_C"
+    v2=$REPLY
+    u=${CPU_TEMP_C:+$CPU_TEMP_C°C}
+    live_cols "Load" "$v1" "$c$v1$C_RST" "Temp" "${u:-N/A}" "$v2"
+    format_mhz "$CPU_FREQ_MHZ"
+    v1=$REPLY
+    live_cols "Freq" "$v1" "$C_WHITE$v1$C_RST" "Tasks" "${CPU_TASKS:-N/A}" "$C_WHITE${CPU_TASKS:-N/A}$C_RST"
+    if [[ -n $NET_IFACE ]]; then
+        human_bytes "$LIVE_RX_RATE"; r="↓ $REPLY/s"
+        human_bytes "$LIVE_TX_RATE"; r+="   ↑ $REPLY/s"
+        printf ' %s%-9s%s%s%-8s%s %s\n' "$C_GRAY" "Network" "$C_RST" "$C_CYAN" "$NET_IFACE" "$C_RST" "$r"
+    fi
+
+    print_section "PTERODACTYL"
+    if (( PTERO_DETECTED )); then
+        state_color "$WINGS_STATE"; c=$REPLY
+        state_color "$DOCKER_STATE"
+        live_cols "Wings" "● $WINGS_STATE" "$c● $C_BOLD$WINGS_STATE$C_RST" \
+                  "Docker" "● $DOCKER_STATE" "$REPLY● $C_BOLD$DOCKER_STATE$C_RST"
+        v1=${PTERO_SERVERS:-N/A} v2=${PTERO_ONLINE:-N/A} u=${PTERO_OFFLINE:-N/A}
+        c=$C_WHITE
+        [[ $u =~ ^[1-9] ]] && c=$C_RED
+        live_cols "Servers" "$v1" "$C_BOLD$C_WHITE$v1$C_RST" "Online" "$v2" "$C_GREEN$v2$C_RST"
+        live_cols "Offline" "$u" "$c$u$C_RST" "Source" "${PTERO_SOURCE:-N/A}" "$C_GRAY${PTERO_SOURCE:-N/A}$C_RST"
+    else
+        print_kv "Status" "NOT DETECTED" "$C_GRAY"
+    fi
+    printf -v clock '%(%H:%M:%S)T' -1
+    printf '\n %s%s  ·  refresh %ss  ·  press q or Ctrl+C to exit%s\n' "$C_GRAY" "$clock" "$CFG_LIVE_INTERVAL" "$C_RST"
+}
+
+LIVE_RX_RATE=0 LIVE_TX_RATE=0
+
+live_mode() {
+    local key rc frame rx0 tx0 us0 dt
+    if [[ ! -t 1 ]]; then
+        msg_err "--live requires an interactive terminal"
+        return 1
+    fi
+    LIVE_ACTIVE=1
+    trap 'live_cleanup; exit 0' INT TERM HUP
+    trap 'live_cleanup' EXIT
+    trap ':' WINCH
+    printf '\e[?1049h\e[?25l\e[H\e[2J'
+    printf '\n  %sEliteHost ServerInfo%s - collecting data...\n' "$C_BRAND" "$C_RST"
+
+    query_services wings docker nginx apache2 pteroq
+    get_system_info
+    get_cpu_info
+    get_network_info
+    get_docker_info
+    get_pterodactyl_info
+    cpu_sample
+    rx0=$NET_RX tx0=$NET_TX us0=$CPU_SAMPLE_US
+    nap 0.5
+
+    while :; do
+        setup_layout
+        LIVE_BAR_W=$(( W - 36 ))
+        (( LIVE_BAR_W > 30 )) && LIVE_BAR_W=30
+        (( LIVE_BAR_W < 10 )) && LIVE_BAR_W=10
+        measure_cpu_usage 0
+        get_cpu_dynamic
+        get_clock
+        get_memory_info
+        get_disk_info
+        if [[ -n $NET_IFACE ]]; then
+            read_first NET_RX "/sys/class/net/$NET_IFACE/statistics/rx_bytes" || NET_RX=$rx0
+            read_first NET_TX "/sys/class/net/$NET_IFACE/statistics/tx_bytes" || NET_TX=$tx0
+            dt=$(( CPU_SAMPLE_US - us0 ))
+            if (( dt > 0 )); then
+                LIVE_RX_RATE=$(( (NET_RX - rx0) * 1000000 / dt ))
+                LIVE_TX_RATE=$(( (NET_TX - tx0) * 1000000 / dt ))
+                (( LIVE_RX_RATE < 0 )) && LIVE_RX_RATE=0
+                (( LIVE_TX_RATE < 0 )) && LIVE_TX_RATE=0
+            fi
+            rx0=$NET_RX tx0=$NET_TX
+        fi
+        us0=$CPU_SAMPLE_US
+
+        frame=$(render_live_frame)
+        printf '\e[H%s\e[K\e[J' "${frame//$'\n'/$'\e[K\n'}"
+
+        if read -rsn1 -t "$CFG_LIVE_INTERVAL" key < /dev/tty 2>/dev/null; then
+            [[ $key == [qQ] ]] && break
+        else
+            rc=$?
+            (( rc <= 128 )) && nap "$CFG_LIVE_INTERVAL"
+        fi
+        # slower-changing data, refreshed inside the next measuring window
+        query_services wings docker nginx apache2 pteroq
+        get_docker_info
+        get_pterodactyl_info refresh
+    done
+    live_cleanup
+    return 0
+}
+
+# ============================================================================
+# HELP / VERSION / COMPLETION / DEFAULT CONFIG / UNINSTALL
+# ============================================================================
+print_help() {
+    local b=$C_BOLD$C_BRAND r=$C_RST g=$C_GRAY w=$C_BOLD$C_WHITE
+    cat <<EOF
+${b}EliteHost ServerInfo${r} ${g}v${SI_VERSION}${r}
+Server information & monitoring for Pterodactyl hosting nodes (Debian 12/13).
+
+${w}USAGE${r}
+  serverinfo [OPTIONS]
+
+${w}VIEWS${r}
+  (no option)          Full overview: system, CPU, memory, storage, network,
+                       Docker, Pterodactyl and health status
+  -l, --live           Live monitor, refreshes every ${CFG_LIVE_INTERVAL}s (q or Ctrl+C to exit)
+      --system         System information
+  -c, --cpu            CPU information
+  -r, --ram            Memory and swap                (alias: --memory)
+  -d, --disk           Storage                        (alias: --storage)
+  -n, --network        Network                        (alias: --net)
+  -p, --pterodactyl    Panel, Wings and game servers  (alias: --ptero)
+      --docker         Docker engine
+  -s, --status         Health status summary          (alias: --health)
+  -j, --json           Valid JSON output (combine with the views above)
+
+${w}OPTIONS${r}
+  -i, --interval SEC   Live mode refresh interval, 1-60 seconds (default ${CFG_LIVE_INTERVAL})
+      --public-ip      Allow one HTTPS request to detect the public IP behind NAT
+      --no-color       Disable colors (the NO_COLOR variable is honored too)
+      --color          Force colors even when the output is not a terminal
+  -h, --help           Show this help
+  -v, --version        Show the version
+      --uninstall      Remove EliteHost ServerInfo (add --yes to skip the prompt)
+
+${w}EXAMPLES${r}
+  serverinfo                     full report
+  serverinfo --live              live monitor
+  serverinfo -cr                 CPU + memory
+  serverinfo --pterodactyl       panel / wings / game servers
+  serverinfo --json | jq .pterodactyl
+
+${g}Config file: ${SI_CONFIG_FILE}${r}
+EOF
+}
+
+print_completion() {
+    cat <<'EOF'
+# bash completion for serverinfo (EliteHost ServerInfo)
+# ELITEHOST-SERVERINFO
+_serverinfo() {
+    local cur prev
+    cur=${COMP_WORDS[COMP_CWORD]}
+    prev=${COMP_WORDS[COMP_CWORD-1]}
+    case $prev in
+        -i|--interval)
+            COMPREPLY=($(compgen -W "1 2 3 5 10" -- "$cur"))
+            return 0
+            ;;
+        --uninstall)
+            COMPREPLY=($(compgen -W "--yes --keep-config" -- "$cur"))
+            return 0
+            ;;
+    esac
+    COMPREPLY=($(compgen -W "--help --version --live --interval --system --cpu --ram --memory
+        --disk --storage --network --net --pterodactyl --ptero --docker --status --health
+        --json --no-color --color --public-ip --uninstall" -- "$cur"))
+}
+complete -F _serverinfo serverinfo
+EOF
+}
+
+print_default_config() {
+    cat <<'EOF'
+# /etc/elitehost/serverinfo.conf - EliteHost ServerInfo configuration
+# ELITEHOST-SERVERINFO
+# Format: KEY=VALUE. This file is parsed, never executed. Invalid values are ignored.
+
+# Brand color (256-color palette index 0-255) and logo gradient (one index per logo line)
+BRAND_COLOR=135
+LOGO_COLORS="129 135 99 105 69 75"
+
+# Public IP. If the primary interface has a public IPv4 it is shown directly.
+# Behind NAT, "yes" allows ONE HTTPS request to the service below (default: no).
+PUBLIC_IP_LOOKUP=no
+PUBLIC_IP_URL="https://api.ipify.org"
+
+# Pterodactyl
+WINGS_CONFIG=/etc/pterodactyl/config.yml
+PANEL_DIR=                  # empty = auto-detect (/var/www/pterodactyl, nginx/apache roots)
+WINGS_API=auto              # auto | off  - live server states from the local Wings API (root)
+PANEL_DATABASE=auto         # auto | off  - read-only COUNT queries on the panel database (root)
+
+# Health thresholds (percent)
+CPU_WARN=70
+CPU_CRIT=90
+RAM_WARN=80
+RAM_CRIT=90
+DISK_WARN=80
+DISK_CRIT=90
+
+# Live mode refresh interval (seconds, 1-60)
+LIVE_INTERVAL=2
+EOF
+}
+
+do_uninstall() {
+    local un="$SI_LIB_DIR/uninstall.sh"
+    if [[ -f $un ]]; then
+        exec bash "$un" "$@"
+    fi
+    msg_err "uninstaller not found: $un"
+    echo "Run uninstall.sh from the project directory instead." >&2
+    return 1
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+readonly CPU_WINDOW_US=400000
+declare -A WANT=()
+
+want() { [[ -n ${WANT[all]:-} || -n ${WANT[$1]:-} ]]; }
+
+collect_data() {
+    local cpu=0 mem=0 disk=0 net=0 docker=0 ptero=0 status=0
+    want cpu && cpu=1
+    want memory && mem=1
+    want storage && disk=1
+    want network && net=1
+    want docker && docker=1
+    want pterodactyl && ptero=1 docker=1
+    if want status; then
+        status=1 cpu=1 mem=1 disk=1 docker=1 ptero=1
+    fi
+    (( docker || ptero )) && query_services wings docker nginx apache2 pteroq
+    get_system_info
+    (( cpu )) && get_cpu_info
+    (( mem )) && get_memory_info
+    (( disk )) && get_disk_info
+    if (( net )); then
+        get_network_info
+        [[ -z ${WANT[all]:-} ]] && get_other_interfaces
+    fi
+    (( docker )) && get_docker_info
+    (( ptero )) && get_pterodactyl_info
+    if (( cpu )); then
+        # dedicated quiet window: serverinfo's own work is not counted as load
+        cpu_sample
+        measure_cpu_usage "$CPU_WINDOW_US"
+    fi
+    (( status )) && get_health_status
+    return 0
+}
+
+render_report() {
+    if [[ -n ${WANT[all]:-} ]]; then
+        print_header full
+    else
+        print_header compact
+    fi
+    want system && render_system
+    want cpu && render_cpu
+    want memory && render_memory
+    want storage && render_storage
+    if want network; then
+        if [[ -n ${WANT[all]:-} ]]; then render_network; else render_network detail; fi
+    fi
+    want docker && render_docker
+    want pterodactyl && render_pterodactyl
+    want status && render_status
+    print_footer
+}
+
+main() {
+    local mode=report json=0 a i s
+    local -a args=() sections=()
+    for a in "$@"; do
+        if [[ $a =~ ^-[A-Za-z]{2,}$ ]]; then
+            for (( i = 1; i < ${#a}; i++ )); do args+=("-${a:i:1}"); done
+        else
+            args+=("$a")
+        fi
+    done
+    set -- "${args[@]}"
+    load_config
+
+    while (( $# > 0 )); do
+        case $1 in
+            -h|--help)               mode=help ;;
+            -v|-V|--version)         mode=version ;;
+            -l|--live)               mode=live ;;
+            -j|--json)               json=1 ;;
+            --system)                sections+=(system) ;;
+            -c|--cpu)                sections+=(cpu) ;;
+            -r|--ram|--memory|--mem) sections+=(memory) ;;
+            -d|--disk|--storage)     sections+=(storage) ;;
+            -n|--network|--net)      sections+=(network) ;;
+            -p|--pterodactyl|--ptero) sections+=(pterodactyl) ;;
+            --docker)                sections+=(docker) ;;
+            -s|--status|--health)    sections+=(status) ;;
+            --no-color|--no-colour)  COLOR_MODE=never ;;
+            --color|--colour)        COLOR_MODE=always ;;
+            --public-ip)             CFG_PUBLIC_IP_LOOKUP=yes ;;
+            -i|--interval|--interval=*)
+                if [[ $1 == --interval=* ]]; then s=${1#*=}; else s=${2:-}; shift; fi
+                if [[ $s =~ ^[0-9]{1,2}$ ]] && (( 10#$s >= 1 && 10#$s <= 60 )); then
+                    CFG_LIVE_INTERVAL=$(( 10#$s ))
+                else
+                    msg_err "--interval expects a number of seconds between 1 and 60"
+                    return 2
+                fi
+                ;;
+            --uninstall)             shift; do_uninstall "$@"; return $? ;;
+            --completion)            print_completion; return 0 ;;
+            --print-config)          print_default_config; return 0 ;;
+            *)
+                msg_err "unknown option: $1"
+                echo "Try 'serverinfo --help' for the list of options." >&2
+                return 2
+                ;;
+        esac
+        shift
+    done
+
+    case $mode in
+        help)
+            setup_colors
+            print_help
+            return 0
+            ;;
+        version)
+            printf '%s %s\n' "$SI_NAME" "$SI_VERSION"
+            return 0
+            ;;
+        live)
+            if (( json )); then
+                msg_err "--live cannot be combined with --json"
+                return 2
+            fi
+            setup_colors
+            setup_layout
+            live_mode
+            return $?
+            ;;
+    esac
+
+    (( json )) && COLOR_MODE=never
+    setup_colors
+    setup_layout
+    if (( ${#sections[@]} == 0 )); then
+        WANT[all]=1
+    else
+        for s in "${sections[@]}"; do WANT[$s]=1; done
+    fi
+    collect_data
+    if (( json )); then
+        json_mode
+    else
+        render_report
+    fi
+}
+
+main "$@"
+exit $?
