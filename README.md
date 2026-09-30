@@ -7,6 +7,10 @@ Debian 12 (bookworm) va Debian 13 (trixie) uchun optimallashtirilgan, Bash 5.x d
 va o'yin serverlarining holatini chiroyli, rangli va tartibli ko'rinishda chiqaradi.
 Bu oddiy neofetch emas — ma'lumotlar hosting node'lari uchun moslashtirilgan.
 
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/SSMertnix/serverinfoscript/HEAD/install.sh)
+```
+
 ---
 
 ## Imkoniyatlar
@@ -34,6 +38,7 @@ Bu oddiy neofetch emas — ma'lumotlar hosting node'lari uchun moslashtirilgan.
 | Shell | Bash 5.x |
 | Huquq | O'rnatish uchun `root`. Ishlatish — istalgan foydalanuvchi (to'liq ma'lumot root bilan) |
 | Paketlar | `curl`, `jq`, `iproute2`, `procps`, `util-linux`, `ca-certificates` — installer yetishmayotganlarini o'zi o'rnatadi |
+| Online o'rnatish | `curl` yoki `wget` (+ `tar`, `gzip` — Debian'da doim bor) |
 
 Barcha paketlar ixtiyoriy: biror buyruq bo'lmasa, `serverinfo` yiqilmaydi — o'sha qiymat `N/A` bo'lib chiqadi.
 `lm-sensors` shart emas: harorat to'g'ridan-to'g'ri kernel `hwmon`/`thermal` interfeysidan o'qiladi.
@@ -42,30 +47,101 @@ Barcha paketlar ixtiyoriy: biror buyruq bo'lmasa, `serverinfo` yiqilmaydi — o'
 
 ## O'rnatish
 
-Loyiha fayllarini (`install.sh`, `uninstall.sh`, `serverinfo`) **bitta papkaga** joylang, so'ng:
+### ⚡ Online — bitta buyruq (tavsiya etiladi)
+
+Serverda **root** sifatida:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/SSMertnix/serverinfoscript/HEAD/install.sh)
+```
+
+`sudo` bilan (oddiy foydalanuvchidan):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SSMertnix/serverinfoscript/HEAD/install.sh | sudo bash
+```
+
+`curl` bo'lmasa — `wget` bilan:
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/SSMertnix/serverinfoscript/HEAD/install.sh)
+```
+
+> ⚠️ `sudo bash <(curl ...)` ishlamaydi — `sudo` process substitution fayl deskriptorini yopib qo'yadi.
+> sudo kerak bo'lsa, yuqoridagi `curl ... | sudo bash` shaklidan foydalaning.
+>
+> ⚠️ Bir qatorli o'rnatish uchun GitHub repo **public** bo'lishi kerak
+> (private repo'dan `raw.githubusercontent.com` 404 qaytaradi — pastdagi "Private repo" bo'limiga qarang).
+
+Online rejimda installer:
+
+1. Bash, `root` huquqi va Debian versiyasini (12 yoki 13) tekshiradi
+2. `HEAD` (yoki `--ref`) ni **aniq commit'ga bog'laydi** va o'sha commit'ning **bitta arxivini** HTTPS orqali yuklaydi —
+   barcha fayllar bir xil versiyadan bo'ladi
+3. Arxivni tekshiradi (imzo, `bash -n` sintaksis, SHA-256), faqat `serverinfo` va `uninstall.sh` ni oladi
+4. Yetishmayotgan paketlarni **faqat kerak bo'lsa** `apt` orqali o'rnatadi
+5. `/usr/local/bin/serverinfo` ga o'rnatadi (atomar), uninstaller, konfiguratsiya va bash completion qo'shadi
+6. Self-test (`serverinfo --json`) bilan tekshiradi, vaqtinchalik fayllarni o'chiradi
+
+| Parametr | Vazifasi |
+|---|---|
+| `--ref REF` | Aniq versiya: branch, tag yoki commit (standart: `HEAD` = default branch) |
+| `--uninstall` | O'chirish (`--yes`, `--keep-config` bilan birga) |
+| `--online` | Yonida lokal fayllar bo'lsa ham GitHub'dan yuklash |
+| `--force` | Qo'llab-quvvatlanmaydigan OS'da ham o'rnatish (masalan Ubuntu) |
+| `--skip-deps` | `apt` orqali paket o'rnatmaslik |
+| `--no-color` | Ranglarsiz chiqish |
+| `-h`, `--help` | Yordam |
+
+Parametrlar bir qatorli buyruqqa oxiridan qo'shiladi:
+
+```bash
+# aniq versiya: tag (masalan v1.0.0 - GitHub'da shunday tag/release yaratilgan bo'lsa) yoki commit SHA.
+# commit SHA - eng xavfsiz, o'zgarmaydigan o'rnatish
+bash <(curl -fsSL https://raw.githubusercontent.com/SSMertnix/serverinfoscript/HEAD/install.sh) --ref v1.0.0
+
+# sudo + parametr
+curl -fsSL https://raw.githubusercontent.com/SSMertnix/serverinfoscript/HEAD/install.sh | sudo bash -s -- --ref v1.0.0
+
+# yuklangan serverinfo faylining SHA-256 si mos kelmasa - o'rnatish to'xtatiladi
+SERVERINFO_SHA256=<sha256> bash <(curl -fsSL https://raw.githubusercontent.com/SSMertnix/serverinfoscript/HEAD/install.sh)
+```
+
+| O'zgaruvchi | Vazifasi |
+|---|---|
+| `SERVERINFO_REF` | `--ref` bilan bir xil |
+| `SERVERINFO_SHA256` | Kutilgan SHA-256 (mos kelmasa — to'xtaydi) |
+| `SERVERINFO_REPO` | Fork'dan o'rnatish (`owner/name`) |
+| `GITHUB_TOKEN` / `SERVERINFO_GITHUB_TOKEN` | Faqat private repo uchun o'qish tokeni |
+
+**Yangilash** — o'sha buyruqni qayta ishga tushiring (konfiguratsiya saqlanib qoladi).
+**O'chirish** — `serverinfo --uninstall` yoki `bash <(curl -fsSL .../install.sh) --uninstall`.
+
+#### Private repo
+
+Repo private bo'lsa, `repo` (yoki fine-grained "Contents: Read") huquqli token bilan:
+
+```bash
+export GITHUB_TOKEN=github_pat_xxxxxxxx
+bash <(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+  https://raw.githubusercontent.com/SSMertnix/serverinfoscript/HEAD/install.sh)
+```
+
+Installer tokenni faqat `api.github.com` ga va faqat `curl` ning stdin konfiguratsiyasi orqali yuboradi
+(buyruq qatorida/`ps` da ko'rinmaydi). Eng qulay yo'l — repo'ni **public** qilish:
+GitHub → Settings → General → Danger Zone → *Change visibility*.
+
+### 📦 Lokal — fayllardan
+
+Loyiha fayllarini (`install.sh`, `uninstall.sh`, `serverinfo`) **bitta papkaga** joylang (yoki `git clone`), so'ng:
 
 ```bash
 chmod +x install.sh
 sudo ./install.sh
 ```
 
-Installer quyidagilarni bajaradi:
-
-1. Bash versiyasi, `root` huquqi va Debian versiyasini (12 yoki 13) tekshiradi
-2. Yetishmayotgan paketlarni **faqat kerak bo'lsa** `apt` orqali o'rnatadi
-3. `serverinfo` ni `/usr/local/bin/serverinfo` ga o'rnatadi (atomar almashtirish, `chmod 755`)
-4. Uninstaller, standart konfiguratsiya va bash completion'ni o'rnatadi
-5. O'rnatishni tekshiradi (`serverinfo --version`, `serverinfo --json` self-test)
-
-| Installer parametri | Vazifasi |
-|---|---|
-| `--force` | Qo'llab-quvvatlanmaydigan OS'da ham o'rnatish (masalan Ubuntu) |
-| `--skip-deps` | `apt` orqali paket o'rnatmaslik |
-| `--no-color` | Ranglarsiz chiqish |
-| `-h`, `--help` | Yordam |
-
-Qayta ishga tushirish xavfsiz: mavjud o'rnatish yangilanadi, mavjud konfiguratsiya saqlanib qoladi.
-Installer internetdan hech qanday kod yuklamaydi (`curl | bash` yo'q) — hamma narsa yonidagi fayllardan o'rnatiladi.
+Lokal rejimda installer internetdan hech narsa yuklamaydi — hamma narsa yonidagi fayllardan o'rnatiladi.
+Qayta ishga tushirish xavfsiz: mavjud o'rnatish yangilanadi, konfiguratsiya saqlanib qoladi.
 
 ---
 
@@ -238,7 +314,10 @@ Fayl **faqat o'qiladi (parse)**, hech qachon bajarilmaydi (`source` qilinmaydi);
 - Panel papkasidagi PHP kod **ishga tushirilmaydi** (`php artisan` yo'q) — www-data → root privilege escalation xavfi yo'q
 - To'xtatilgan Docker "uyg'otilmaydi": `docker.socket` faol bo'lsa ham, engine ishlamayotganda Docker API'ga murojaat qilinmaydi
 - Tizimdan olingan barcha matnlar boshqaruv belgilari va noto'g'ri UTF-8 baytlardan tozalanadi (terminal escape injection himoyasi, JSON doim valid)
-- Internetdan kod yuklanmaydi, masofaviy skript bajarilmaydi; yagona ixtiyoriy tashqi so'rov — `PUBLIC_IP_LOOKUP` (standartda o'chiq)
+- `serverinfo` o'zi internetdan kod yuklamaydi va masofaviy skript bajarmaydi; yagona ixtiyoriy tashqi so'rov — `PUBLIC_IP_LOOKUP` (standartda o'chiq)
+- Online installer faqat shu loyihaning GitHub repo'sidan, faqat HTTPS (TLS 1.2+) orqali, **aniq commit'ga bog'langan** bitta arxivni yuklaydi;
+  `--ref`/repo nomlari qat'iy tekshiriladi, arxiv egalari/huquqlari qabul qilinmaydi, fayllar imzo + sintaksis + (ixtiyoriy) SHA-256 bilan tekshiriladi.
+  Maksimal ishonch uchun: `--ref <commit>` va `SERVERINFO_SHA256` bilan o'rnating
 
 ---
 
@@ -246,6 +325,7 @@ Fayl **faqat o'qiladi (parse)**, hech qachon bajarilmaydi (`source` qilinmaydi);
 
 ```bash
 sudo serverinfo --uninstall        # yoki: sudo ./uninstall.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/SSMertnix/serverinfoscript/HEAD/install.sh) --uninstall
 ```
 
 | Parametr | Vazifasi |
@@ -267,6 +347,8 @@ papkalar faqat bo'sh bo'lsa o'chiriladi. Pterodactyl, Wings, Docker va tizim pak
 | Ranglar noto'g'ri | `serverinfo --no-color` yoki terminalda `TERM=xterm-256color` |
 | Harorat `N/A` | VPS'da sensor yo'q — bu normal holat |
 | Public IP `N/A (private address / NAT)` | `serverinfo --public-ip` yoki konfiguratsiyada `PUBLIC_IP_LOOKUP=yes` |
+| Online: `Download failed` / `not found` | Repo public ekanini, `--ref` to'g'riligini va tarmoqni tekshiring; xato tafsilotlari `/tmp/elitehost-serverinfo-install.*.log` da |
+| `sudo bash <(curl ...)`: `/dev/fd/63: No such file` | `curl -fsSL <url> \| sudo bash` shaklidan foydalaning |
 | `apt` o'rnata olmadi | Tarmoq/repo muammosi; `serverinfo` baribir ishlaydi, keyin `apt install curl jq iproute2 procps` |
 
 ---
@@ -275,7 +357,7 @@ papkalar faqat bo'sh bo'lsa o'chiriladi. Pterodactyl, Wings, Docker va tizim pak
 
 ```text
 elitehost-serverinfo/
-├── install.sh      # o'rnatuvchi (Debian 12/13 tekshiruvi, dependency'lar, fayllar)
+├── install.sh      # online (bash <(curl ...)) + lokal o'rnatuvchi
 ├── uninstall.sh    # xavfsiz o'chiruvchi
 ├── serverinfo      # asosiy CLI utilita (/usr/local/bin/serverinfo)
 ├── README.md
