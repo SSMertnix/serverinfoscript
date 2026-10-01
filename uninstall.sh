@@ -11,7 +11,7 @@
 # ============================================================================
 
 if [ -z "${BASH_VERSION:-}" ]; then
-    echo "This uninstaller needs bash. Run: sudo bash uninstall.sh" >&2
+    echo "Bu oʻchirish dasturi bash talab qiladi. Ishga tushiring: sudo bash uninstall.sh" >&2
     exit 1
 fi
 
@@ -55,16 +55,16 @@ box() {
 
 usage() {
     cat <<EOF
-EliteHost ServerInfo uninstaller
+EliteHost ServerInfo oʻchirish dasturi
 
-Usage: sudo ./uninstall.sh [OPTIONS]
-       sudo serverinfo --uninstall [OPTIONS]
+Foydalanish: sudo ./uninstall.sh [PARAMETRLAR]
+             sudo serverinfo --uninstall [PARAMETRLAR]
 
-Options:
-  -y, --yes        Do not ask for confirmation
-  --keep-config    Keep $CONF_FILE
-  --no-color       Disable colored output
-  -h, --help       Show this help
+Parametrlar:
+  -y, --yes        Tasdiqlash soʻralmasin
+  --keep-config    $CONF_FILE saqlab qolinsin
+  --no-color       Ranglarsiz chiqish
+  -h, --help       Shu yordam
 EOF
 }
 
@@ -82,37 +82,37 @@ main() {
             --keep-config) KEEP_CONFIG=1 ;;
             --no-color|--no-colour) USE_COLOR=0 ;;
             -h|--help) usage; exit 0 ;;
-            *) usage >&2; echo >&2; die "Unknown option: $1" ;;
+            *) usage >&2; echo >&2; die "Nomaʼlum parametr: $1" ;;
         esac
         shift
     done
     setup_colors
     echo
-    box "ELITEHOST SERVERINFO · UNINSTALL"
+    box "ELITEHOST SERVERINFO · OʻCHIRISH"
     echo
-    (( EUID == 0 )) || die "Root privileges are required. Run: sudo $0 (or: sudo serverinfo --uninstall)"
+    (( EUID == 0 )) || die "Root huquqi kerak. Ishga tushiring: sudo $0 (yoki: sudo serverinfo --uninstall)"
 
     for f in "$BIN_PATH" "$COMPLETION_FILE" "$LIB_DIR/uninstall.sh"; do
         if is_ours "$f"; then
             targets+=("$f")
         elif [[ -e $f ]]; then
-            warn "Skipping $f - it does not belong to EliteHost ServerInfo"
+            warn "Oʻtkazib yuborildi: $f - EliteHost ServerInfo ga tegishli emas"
         fi
     done
     if (( KEEP_CONFIG )); then
-        [[ -e $CONF_FILE ]] && info "Keeping configuration $CONF_FILE (--keep-config)"
+        [[ -e $CONF_FILE ]] && info "Sozlamalar saqlanadi: $CONF_FILE (--keep-config)"
     elif is_ours "$CONF_FILE"; then
         targets+=("$CONF_FILE")
     elif [[ -e $CONF_FILE ]]; then
-        warn "Skipping $CONF_FILE - signature line missing, remove it manually if needed"
+        warn "Oʻtkazib yuborildi: $CONF_FILE - imzo qatori yoʻq, kerak boʻlsa qoʻlda oʻchiring"
     fi
 
     if (( ${#targets[@]} == 0 )); then
-        info "EliteHost ServerInfo is not installed - nothing to remove"
+        info "EliteHost ServerInfo oʻrnatilmagan - oʻchiradigan narsa yoʻq"
         exit 0
     fi
 
-    info "The following files will be removed:"
+    info "Quyidagi fayllar oʻchiriladi:"
     for f in "${targets[@]}"; do
         printf '     %s%s%s\n' "$C_GRAY" "$f" "$C_RST"
     done
@@ -120,31 +120,31 @@ main() {
 
     if (( ! ASSUME_YES )); then
         if [[ ! -t 0 ]]; then
-            die "No terminal to confirm on. Re-run with --yes to remove without a prompt."
+            die "Tasdiqlash uchun terminal yoʻq. Soʻrovsiz oʻchirish uchun --yes bilan qayta ishga tushiring."
         fi
-        read -r -p " Remove EliteHost ServerInfo? [y/N] " answer
-        if [[ ! $answer =~ ^[Yy]([Ee][Ss])?$ ]]; then
-            info "Aborted - nothing was removed"
+        read -r -p " EliteHost ServerInfo oʻchirilsinmi? [ha/YOʻQ] " answer
+        if [[ ! $answer =~ ^([Hh]([Aa])?|[Yy]([Ee][Ss])?)$ ]]; then
+            info "Bekor qilindi - hech narsa oʻchirilmadi"
             exit 0
         fi
     fi
 
     for f in "${targets[@]}"; do
         if rm -f -- "$f"; then
-            ok "Removed $f"
+            ok "Oʻchirildi: $f"
             removed=$(( removed + 1 ))
         else
-            warn "Could not remove $f"
+            warn "Oʻchirib boʻlmadi: $f"
         fi
     done
     # directories are removed only if they are empty (rmdir never deletes content)
     for f in "$LIB_DIR" "$CONF_DIR" "${COMPLETION_FILE%/*}" "${COMPLETION_FILE%/*/*}"; do
-        rmdir -- "$f" 2>/dev/null && ok "Removed empty directory $f"
+        rmdir -- "$f" 2>/dev/null && ok "Boʻsh papka oʻchirildi: $f"
     done
 
     echo
-    box "ELITEHOST SERVERINFO REMOVED"
-    printf '\n %s%d file(s) removed. Pterodactyl, Wings, Docker and system packages were not touched.%s\n\n' \
+    box "ELITEHOST SERVERINFO OʻCHIRILDI"
+    printf '\n %s%d ta fayl oʻchirildi. Pterodactyl, Wings, Docker va tizim paketlariga tegilmadi.%s\n\n' \
         "$C_GRAY" "$removed" "$C_RST"
 }
 

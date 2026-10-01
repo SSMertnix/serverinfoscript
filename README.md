@@ -15,9 +15,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/SSMertnix/serverinfoscript/H
 
 ## Imkoniyatlar
 
+- **Toʻliq oʻzbek tilida** — barcha ekran matnlari, holatlar, yordam, xatolar, installer (lotin yozuvi: oʻ, gʻ, ʼ)
 - **Premium terminal dizayni** — EliteHost logotipi (gradient), ramkali sarlavha, rangli progress-barlar, holat indikatorlari
 - **Pterodactyl aniqlash** — Panel, Wings, `wings` servisi, Docker va o'yin serverlari soni (jami / online / offline)
-- **Aniq server hisobi** — Wings API → Docker (+ Wings `states.json`) → Panel DB. Aniqlab bo'lmasa `N/A`, hech qachon taxminiy son emas
+- **Aniq server hisobi** — Wings API → Docker (+ Wings `states.json`) → Panel DB. Aniqlab boʻlmasa `nomaʼlum` (JSON'da `null`), hech qachon taxminiy son emas
 - **CPU** — model, fizik yadrolar, thread'lar, real-time yuklanish, load average, joriy/maksimal chastota, harorat
 - **RAM** — total, used, available, free, cached, usage %, swap (total/used/free)
 - **Storage** — NVMe SSD / SSD / HDD / virtual disk aniqlash, RAID/LVM/LUKS qatlamlari, barcha fayl tizimlari
@@ -40,7 +41,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/SSMertnix/serverinfoscript/H
 | Paketlar | `curl`, `jq`, `iproute2`, `procps`, `util-linux`, `ca-certificates` — installer yetishmayotganlarini o'zi o'rnatadi |
 | Online o'rnatish | `curl` yoki `wget` (+ `tar`, `gzip` — Debian'da doim bor) |
 
-Barcha paketlar ixtiyoriy: biror buyruq bo'lmasa, `serverinfo` yiqilmaydi — o'sha qiymat `N/A` bo'lib chiqadi.
+Barcha paketlar ixtiyoriy: biror buyruq bo'lmasa, `serverinfo` yiqilmaydi — o'sha qiymat `nomaʼlum` bo'lib chiqadi.
 `lm-sensors` shart emas: harorat to'g'ridan-to'g'ri kernel `hwmon`/`thermal` interfeysidan o'qiladi.
 
 ---
@@ -149,7 +150,7 @@ Qayta ishga tushirish xavfsiz: mavjud o'rnatish yangilanadi, konfiguratsiya saql
 
 | Buyruq | Natija |
 |---|---|
-| `serverinfo` | To'liq hisobot: SYSTEM, CPU, MEMORY, STORAGE, NETWORK, DOCKER, PTERODACTYL, STATUS |
+| `serverinfo` | Toʻliq hisobot: TIZIM, PROTSESSOR, XOTIRA, DISK, TARMOQ, DOCKER, PTERODACTYL, HOLAT |
 | `serverinfo --live` | Live monitor, har 2 soniyada yangilanadi (`q` / `Ctrl+C` — chiqish) |
 | `serverinfo --cpu` | Faqat CPU |
 | `serverinfo --ram` | RAM va swap (`--memory`) |
@@ -173,41 +174,42 @@ Bo'limlarni birlashtirish mumkin: `serverinfo --cpu --ram` yoki qisqacha `server
 
 ```text
  PTERODACTYL
- ──────────────────────────────────────────────────────────
- Panel          DETECTED  v1.11.10
- Panel Path     /var/www/pterodactyl
- Web Server     nginx (active)
- Queue Worker   pteroq (active)
- Wings          ONLINE  v1.11.13
- Wings API      :8080 (HTTPS)  ·  SFTP :2022
- Docker         RUNNING
- Game Data      /var/lib/pterodactyl/volumes
- Data Disk      23.0% used · 1.4 TiB free (/)
- Servers        24
- Online         18
- Offline        5
- Starting       1
- Suspended      2
- Source         Wings API
+ ──────────────────────────────────────────────────────────────
+ Panel              ANIQLANDI  v1.11.10
+ Panel joylashuvi   /var/www/pterodactyl
+ Veb-server         nginx (faol)
+ Navbat xizmati     pteroq (faol)
+ Wings              ONLAYN  v1.11.13
+ Wings API          :8080 (HTTPS)  ·  SFTP :2022
+ Docker             ISHLAYAPTI
+ Oʻyin maʼlumotlari /var/lib/pterodactyl/volumes
+ Maʼlumot diski     23.0% band · 1.4 TiB boʻsh (/)
+ Serverlar          24
+ Onlayn             18
+ Oflayn             5
+ Ishga tushmoqda    1
+ Muzlatilgan        2
+ Manba              Wings API
+ Panel jami         124 ta server · 5 ta node
 
- STATUS
- ──────────────────────────────────────────────────────────
- ● CPU          HEALTHY    23.4%
- ● RAM          HEALTHY    32.8%
- ● STORAGE      HEALTHY    23.0% (/)
- ● WINGS        ONLINE
- ● DOCKER       RUNNING
- ● PTERODACTYL  DETECTED   24 servers · 18 online
+ HOLAT
+ ──────────────────────────────────────────────────────────────
+ ● PROTSESSOR    SOGʻLOM         23.4%
+ ● XOTIRA        SOGʻLOM         32.8%
+ ● DISK          SOGʻLOM         23.0% (/)
+ ● WINGS         ONLAYN
+ ● DOCKER        ISHLAYAPTI
+ ● PTERODACTYL   ANIQLANDI       24 ta server · 18 tasi onlayn
  ────────────────────────
- ● OVERALL      HEALTHY
+ ● UMUMIY        SOGʻLOM
 ```
 
 Pterodactyl topilmasa:
 
 ```text
  PTERODACTYL
- ──────────────────────────────────────────────────────────
- Status         NOT DETECTED
+ ──────────────────────────────────────────────────────────────
+ Holati             ANIQLANMADI
 ```
 
 ---
@@ -223,8 +225,8 @@ Pterodactyl topilmasa:
 - Versiya `config/app.php` dan, queue worker holati `pteroq` servisidan olinadi
 
 **Wings**: `/usr/local/bin/wings`, `/etc/pterodactyl/config.yml` yoki `wings` systemd unit'i.
-Holat `systemctl is-active wings` mantig'i bilan aniqlanadi: `active` → **ONLINE**, aks holda **OFFLINE**,
-Wings yo'q bo'lsa → **NOT INSTALLED**. systemd bo'lmagan muhitda jarayonlar jadvali tekshiriladi.
+Holat `systemctl is-active wings` mantig'i bilan aniqlanadi: `active` → **ONLAYN**, aks holda **OFLAYN**,
+Wings yo'q bo'lsa → **OʻRNATILMAGAN**. systemd bo'lmagan muhitda jarayonlar jadvali tekshiriladi.
 
 ### Serverlarni sanash — usullar tahlili
 
@@ -236,23 +238,23 @@ Wings yo'q bo'lsa → **NOT INSTALLED**. systemd bo'lmagan muhitda jarayonlar ja
 | **Panel API** | API key yaratish va har bir server uchun alohida so'rov talab qiladi (sekin) | qo'lda sozlash | Ishlatilmaydi |
 
 Qoidalar:
-- Hech bir usul aniq natija bermasa: **`Servers N/A`** (taxminiy son hech qachon chiqarilmaydi)
+- Hech bir usul aniq natija bermasa: **`Serverlar  nomaʼlum`** (taxminiy son hech qachon chiqarilmaydi)
 - JSON rejimida noma'lum qiymatlar `null` bo'ladi
-- `Source` qatori raqamlar qaysi manbadan olinganini ko'rsatadi (`Wings API`, `Docker`, `Docker + Panel DB`, `Panel DB`)
+- `Manba` qatori raqamlar qaysi manbadan olinganini ko'rsatadi (`Wings API`, `Docker`, `Docker + Panel bazasi`, `Panel bazasi`)
 
 ---
 
-## Health status
+## Server holati (HOLAT)
 
-| Ko'rsatkich | HEALTHY | WARNING | Yuqori |
+| Koʻrsatkich | SOGʻLOM | DIQQAT | Yuqori |
 |---|---|---|---|
-| CPU | < 70% | 70–90% | ≥ 90% → **HIGH** |
-| RAM | < 80% | 80–90% | ≥ 90% → **CRITICAL** |
-| STORAGE | < 80% | 80–90% | ≥ 90% → **CRITICAL** |
-| WINGS | `active` → **ONLINE** | | `inactive` → **OFFLINE** |
+| PROTSESSOR | < 70% | 70–90% | ≥ 90% → **YUQORI** |
+| XOTIRA | < 80% | 80–90% | ≥ 90% → **KRITIK** |
+| DISK | < 80% | 80–90% | ≥ 90% → **KRITIK** |
+| WINGS | `active` → **ONLAYN** | | `inactive` → **OFLAYN** |
 
-STORAGE barcha yoziladigan fayl tizimlari ichidan eng to'lganiga qarab baholanadi (qaysi mount ekani ko'rsatiladi).
-**OVERALL**: har qanday HIGH/CRITICAL, Wings OFFLINE yoki Wings bor-u Docker ishlamayotgan bo'lsa → CRITICAL.
+DISK barcha yoziladigan fayl tizimlari ichidan eng toʻlganiga qarab baholanadi (qaysi ulanish nuqtasi ekani koʻrsatiladi).
+**UMUMIY**: har qanday YUQORI/KRITIK, Wings OFLAYN yoki Wings bor-u Docker ishlamayotgan boʻlsa → KRITIK.
 Chegaralarni konfiguratsiyada o'zgartirish mumkin.
 
 ---
@@ -277,6 +279,10 @@ serverinfo --pterodactyl --json | jq .pterodactyl
 ```
 
 (Qisqartirilgan namuna. Haqiqiy chiqishda barcha bo'limlar to'liq; baytlar `*_bytes` maydonlarida, odam o'qiydigan qiymatlar yonida.)
+
+JSON — dasturlar va monitoring tizimlari uchun interfeys: **kalitlar va holat kodlari inglizcha qoladi**
+(`HEALTHY`, `WARNING`, `HIGH`, `CRITICAL`, `ONLINE`, `OFFLINE`, `RUNNING`, `STOPPED`, `NO ACCESS`, `NOT INSTALLED` ...),
+shunda skriptlar barqaror ishlaydi. Matnli qiymatlar (ishlash vaqti, izohlar, virtualizatsiya nomi) oʻzbekcha.
 
 ---
 
@@ -342,12 +348,13 @@ papkalar faqat bo'sh bo'lsa o'chiriladi. Pterodactyl, Wings, Docker va tizim pak
 
 | Muammo | Yechim |
 |---|---|
-| `Servers N/A` + "run as root" | `sudo serverinfo` — Wings token va Docker socket faqat root uchun ochiq |
+| `Serverlar  nomaʼlum` + "root huquqi kerak" | `sudo serverinfo` — Wings token va Docker socket faqat root uchun ochiq |
 | `$'\r': command not found` | Fayllar Windows'da CRLF bilan saqlangan: `sed -i 's/\r$//' install.sh uninstall.sh serverinfo` |
 | Ranglar noto'g'ri | `serverinfo --no-color` yoki terminalda `TERM=xterm-256color` |
-| Harorat `N/A` | VPS'da sensor yo'q — bu normal holat |
-| Public IP `N/A (private address / NAT)` | `serverinfo --public-ip` yoki konfiguratsiyada `PUBLIC_IP_LOOKUP=yes` |
-| Online: `Download failed` / `not found` | Repo public ekanini, `--ref` to'g'riligini va tarmoqni tekshiring; xato tafsilotlari `/tmp/elitehost-serverinfo-install.*.log` da |
+| Harorat `nomaʼlum` | VPS'da sensor yo'q — bu normal holat |
+| Ommaviy IP `yoʻq (xususiy manzil / NAT)` | `serverinfo --public-ip` yoki konfiguratsiyada `PUBLIC_IP_LOOKUP=yes` |
+| `oʻ`, `gʻ` oʻrnida kvadratchalar | Terminal UTF-8 rejimida boʻlishi kerak (PuTTY: Window → Translation → UTF-8) va shrift bu belgilarni qoʻllashi kerak |
+| Online: `Yuklab boʻlmadi` / `topilmadi` | Repo public ekanini, `--ref` to'g'riligini va tarmoqni tekshiring; xato tafsilotlari `/tmp/elitehost-serverinfo-install.*.log` da |
 | `sudo bash <(curl ...)`: `/dev/fd/63: No such file` | `curl -fsSL <url> \| sudo bash` shaklidan foydalaning |
 | `apt` o'rnata olmadi | Tarmoq/repo muammosi; `serverinfo` baribir ishlaydi, keyin `apt install curl jq iproute2 procps` |
 

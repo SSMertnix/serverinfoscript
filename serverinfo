@@ -20,11 +20,11 @@
 # ============================================================================
 
 if [ -z "${BASH_VERSION:-}" ]; then
-    echo "serverinfo: bash is required (try: bash $0)" >&2
+    echo "serverinfo: bash kerak (sinab koʻring: bash $0)" >&2
     exit 1
 fi
 if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
-    echo "serverinfo: bash >= 5.0 is required" >&2
+    echo "serverinfo: bash 5.0 yoki undan yangi versiya kerak" >&2
     exit 1
 fi
 
@@ -44,6 +44,8 @@ readonly SI_NAME="EliteHost ServerInfo"
 readonly SI_CONFIG_FILE="${SERVERINFO_CONFIG:-/etc/elitehost/serverinfo.conf}"
 readonly SI_LIB_DIR="/usr/local/lib/elitehost-serverinfo"
 readonly SI_START_US="${EPOCHREALTIME//[!0-9]/}"
+readonly NA="nomaʼlum"        # value could not be determined
+readonly NONE_TXT="yoʻq"      # value is known to be absent
 
 # ----------------------------------------------------------------------------
 # Configuration (defaults; overridable in /etc/elitehost/serverinfo.conf)
@@ -145,7 +147,7 @@ human_bytes() {
     local b=$1 i=0 div=1 scaled
     local -a units=(B KiB MiB GiB TiB PiB EiB)
     if ! is_uint "$b"; then
-        REPLY="N/A"
+        REPLY=$NA
         return 1
     fi
     while (( i < 6 && b >= div * 1024 )); do
@@ -180,28 +182,22 @@ fmt_x10() {
     REPLY="$(( $1 / 10 )).$(( $1 % 10 ))"
 }
 
-# plural N WORD -> REPLY ("1 day", "3 days")
-plural() {
-    if (( $1 == 1 )); then REPLY="$1 $2"; else REPLY="$1 ${2}s"; fi
-}
 
-# format_duration SECONDS [short] -> REPLY ("12 days, 4 hours, 3 minutes" | "12d 4h 3m")
+# format_duration SECONDS [short] -> REPLY ("12 kun, 4 soat, 3 daqiqa" | "12 kun 4 soat")
 format_duration() {
     local s=${1:-0} d h m
     local -a parts=()
     d=$(( s / 86400 ))
     h=$(( s % 86400 / 3600 ))
     m=$(( s % 3600 / 60 ))
+    (( d > 0 )) && parts+=("$d kun")
+    (( h > 0 )) && parts+=("$h soat")
     if [[ ${2:-} == short ]]; then
-        (( d > 0 )) && parts+=("${d}d")
-        (( h > 0 )) && parts+=("${h}h")
-        (( d == 0 )) && parts+=("${m}m")
+        (( d == 0 )) && parts+=("$m daq")
         REPLY="${parts[*]}"
         return 0
     fi
-    if (( d > 0 )); then plural "$d" day; parts+=("$REPLY"); fi
-    if (( h > 0 )); then plural "$h" hour; parts+=("$REPLY"); fi
-    if (( d == 0 && (m > 0 || h == 0) )); then plural "$m" minute; parts+=("$REPLY"); fi
+    (( d == 0 && (m > 0 || h == 0) )) && parts+=("$m daqiqa")
     local IFS=','
     REPLY="${parts[*]}"
     REPLY=${REPLY//,/, }
@@ -211,7 +207,7 @@ format_duration() {
 format_mhz() {
     local mhz=$1
     if ! is_uint "$mhz" || (( mhz == 0 )); then
-        REPLY="N/A"
+        REPLY=$NA
         return 1
     fi
     if (( mhz >= 1000 )); then
@@ -338,8 +334,8 @@ setup_colors() {
     fi
 }
 
-W=58          # layout width (columns)
-KEY_W=14      # key column width
+W=62          # layout width (columns)
+KEY_W=18      # key column width (Uzbek labels are longer)
 BAR_W=24      # progress bar width
 RULE=""
 
@@ -352,7 +348,7 @@ setup_layout() {
         fi
     fi
     is_uint "$cols" && (( cols > 0 )) || cols=80
-    W=58
+    W=62
     (( cols - 2 < W )) && W=$(( cols - 2 ))
     (( W < 40 )) && W=40
     BAR_W=$(( W - KEY_W - 12 ))
@@ -373,17 +369,75 @@ print_section() {
 # print_kv KEY VALUE [COLOR]   (pass "" as COLOR for pre-colored values)
 print_kv() {
     local color=${3-$C_WHITE}
-    [[ $2 == N/A* ]] && color=$C_GRAY
-    printf ' %s%-*s%s %s%s%s\n' "$C_GRAY" "$KEY_W" "$1" "$C_RST" "$color" "$2" "$C_RST"
+    [[ $2 == "$NA"* || $2 == "$NONE_TXT"* ]] && color=$C_GRAY
+    pad "$1" "$KEY_W"
+    printf ' %s%s%s %s%s%s\n' "$C_GRAY" "$REPLY" "$C_RST" "$color" "$2" "$C_RST"
 }
 
-# print_status LABEL STATE
+# print_status LABEL STATE_CODE
 print_status() {
+    local color label
     state_color "$2"
-    printf ' %s●%s %-13s%s%s%s%s\n' "$REPLY" "$C_RST" "$1" "$C_BOLD" "$REPLY" "$2" "$C_RST"
+    color=$REPLY
+    pad "$1" 14
+    label=$REPLY
+    state_label "$2"
+    printf ' %s●%s %s%s%s%s%s\n' "$color" "$C_RST" "$label" "$C_BOLD" "$color" "$REPLY" "$C_RST"
 }
 
-# state_color STATE -> REPLY (color escape for a status word)
+# state_label CODE -> REPLY : Uzbek text for an internal status code
+# (codes stay English: they are compared in code and exported in JSON)
+state_label() {
+    case $1 in
+        HEALTHY)         REPLY="SOGʻLOM" ;;
+        WARNING)         REPLY="DIQQAT" ;;
+        HIGH)            REPLY="YUQORI" ;;
+        CRITICAL)        REPLY="KRITIK" ;;
+        ONLINE)          REPLY="ONLAYN" ;;
+        OFFLINE)         REPLY="OFLAYN" ;;
+        STARTING)        REPLY="ISHGA TUSHMOQDA" ;;
+        RUNNING)         REPLY="ISHLAYAPTI" ;;
+        STOPPED)         REPLY="TOʻXTAGAN" ;;
+        UNKNOWN)         REPLY="NOMAʼLUM" ;;
+        "NO ACCESS")     REPLY="RUXSAT YOʻQ" ;;
+        DETECTED)        REPLY="ANIQLANDI" ;;
+        "NOT DETECTED")  REPLY="ANIQLANMADI" ;;
+        "NOT INSTALLED") REPLY="OʻRNATILMAGAN" ;;
+        *)               REPLY=$1 ;;
+    esac
+}
+
+# svc_label STATE -> REPLY : systemd ActiveState in Uzbek ("faol", "nofaol", ...)
+svc_label() {
+    case $1 in
+        active)       REPLY="faol" ;;
+        inactive)     REPLY="nofaol" ;;
+        failed)       REPLY="xatolik" ;;
+        activating)   REPLY="ishga tushmoqda" ;;
+        deactivating) REPLY="toʻxtamoqda" ;;
+        reloading)    REPLY="qayta yuklanmoqda" ;;
+        missing)      REPLY="$NONE_TXT" ;;
+        *)            REPLY=$1 ;;
+    esac
+}
+
+# link_label OPERSTATE -> REPLY : network interface state in Uzbek
+link_label() {
+    case ${1,,} in
+        up)                  REPLY="YOQILGAN" ;;
+        down|lowerlayerdown) REPLY="OʻCHIQ" ;;
+        dormant)             REPLY="KUTISHDA" ;;
+        notpresent)          REPLY="YOʻQ" ;;
+        *)                   REPLY="NOMAʼLUM" ;;
+    esac
+}
+
+# source_label CODE -> REPLY : where the Pterodactyl server counts came from
+source_label() {
+    REPLY=${1//Panel DB/Panel bazasi}
+}
+
+# state_color STATE -> REPLY (color escape for a status code)
 state_color() {
     case $1 in
         HEALTHY|ONLINE|RUNNING|DETECTED|UP|ACTIVE) REPLY=$C_GREEN ;;
@@ -574,7 +628,7 @@ detect_virtualization() {
     fi
     SYS_VIRT=${v:-unknown}
     case $SYS_VIRT in
-        none)            SYS_VIRT_LABEL="None (bare-metal)" ;;
+        none)            SYS_VIRT_LABEL="Yoʻq (jismoniy server)" ;;
         kvm)             SYS_VIRT_LABEL="KVM" ;;
         qemu)            SYS_VIRT_LABEL="QEMU" ;;
         vmware)          SYS_VIRT_LABEL="VMware" ;;
@@ -585,14 +639,14 @@ detect_virtualization() {
         google)          SYS_VIRT_LABEL="Google Compute Engine" ;;
         parallels)       SYS_VIRT_LABEL="Parallels" ;;
         bhyve)           SYS_VIRT_LABEL="bhyve" ;;
-        openvz)          SYS_VIRT_LABEL="OpenVZ (container)" ;;
-        lxc|lxc-libvirt) SYS_VIRT_LABEL="LXC (container)" ;;
-        systemd-nspawn)  SYS_VIRT_LABEL="systemd-nspawn (container)" ;;
-        docker)          SYS_VIRT_LABEL="Docker (container)" ;;
-        podman)          SYS_VIRT_LABEL="Podman (container)" ;;
+        openvz)          SYS_VIRT_LABEL="OpenVZ (konteyner)" ;;
+        lxc|lxc-libvirt) SYS_VIRT_LABEL="LXC (konteyner)" ;;
+        systemd-nspawn)  SYS_VIRT_LABEL="systemd-nspawn (konteyner)" ;;
+        docker)          SYS_VIRT_LABEL="Docker (konteyner)" ;;
+        podman)          SYS_VIRT_LABEL="Podman (konteyner)" ;;
         wsl)             SYS_VIRT_LABEL="WSL" ;;
-        vm)              SYS_VIRT_LABEL="Virtual machine" ;;
-        unknown)         SYS_VIRT_LABEL="N/A" ;;
+        vm)              SYS_VIRT_LABEL="Virtual mashina" ;;
+        unknown)         SYS_VIRT_LABEL="" ;;
         *)               clean "$SYS_VIRT"; SYS_VIRT_LABEL=$REPLY ;;
     esac
 }
@@ -701,7 +755,7 @@ get_cpu_info() {
     [[ $v =~ ^(.*[^ ])\ +[0-9]+-Core\ Processor$ ]] && v=${BASH_REMATCH[1]}
     v=${v% Processor}
     while [[ $v == *"  "* ]]; do v=${v//  / }; done
-    CPU_MODEL=${v:-Unknown}
+    CPU_MODEL=$v
     clean "$CPU_VENDOR"; CPU_VENDOR=$REPLY
 
     if ! is_uint "$CPU_THREADS"; then
@@ -977,11 +1031,11 @@ get_root_device_kind() {
     n=${#RESOLVED_DISKS[@]}
     if (( n == 0 )); then
         case $ROOT_FSTYPE in
-            overlay) ROOT_KIND="Overlay (container)" ;;
+            overlay) ROOT_KIND="Overlay (konteyner)" ;;
             zfs) ROOT_KIND="ZFS pool" ;;
-            btrfs) ROOT_KIND="Btrfs volume" ;;
-            nfs*|cifs|ceph|glusterfs) ROOT_KIND="Network storage" ;;
-            *) ROOT_KIND="N/A" ;;
+            btrfs) ROOT_KIND="Btrfs hajmi" ;;
+            nfs*|cifs|ceph|glusterfs) ROOT_KIND="Tarmoq xotirasi" ;;
+            *) ROOT_KIND="" ;;
         esac
         return
     fi
@@ -1015,19 +1069,19 @@ get_root_device_kind() {
     elif (( ssd == n )); then ROOT_KIND="SSD"
     elif (( hdd == n )); then ROOT_KIND="HDD"
     elif (( virt == n && virt_ssd == n )); then ROOT_KIND="Virtual SSD"
-    elif (( virt == n )); then ROOT_KIND="Virtual Disk"
+    elif (( virt == n )); then ROOT_KIND="Virtual disk"
     else
         local -a kinds=()
         (( nvme )) && kinds+=("NVMe")
         (( ssd )) && kinds+=("SSD")
         (( hdd )) && kinds+=("HDD")
         (( virt )) && kinds+=("Virtual")
-        ROOT_KIND="Mixed (${kinds[*]})"
+        ROOT_KIND="Aralash (${kinds[*]})"
         ROOT_KIND=${ROOT_KIND// /+}
-        ROOT_KIND=${ROOT_KIND/Mixed+/Mixed }
+        ROOT_KIND=${ROOT_KIND/Aralash+/Aralash }
     fi
     [[ -n $RESOLVED_RAID ]] && layout+=("$RESOLVED_RAID")
-    (( n > 1 )) && layout+=("$n disks")
+    (( n > 1 )) && layout+=("$n ta disk")
     (( RESOLVED_LVM )) && layout+=("LVM")
     (( RESOLVED_CRYPT )) && layout+=("LUKS")
     local IFS=$'\x1e'
@@ -1035,12 +1089,12 @@ get_root_device_kind() {
     ROOT_LAYOUT=${ROOT_LAYOUT//$'\x1e'/ · }
 }
 
-# fs_usage_of PATH -> REPLY ("33.0% used · 1.2 TiB free (/srv)")
+# fs_usage_of PATH -> REPLY ("33.0% band · 1.2 TiB boʻsh (/srv)")
 # Asks df about the path itself, so bind mounts (which df lists only once per
 # device) resolve to the right filesystem.
 fs_usage_of() {
     local out size used avail mnt pct free
-    REPLY="N/A"
+    REPLY=$NA
     have df || return 1
     out=$(run_timeout 3 df -PB1 -- "$1" 2>/dev/null)
     [[ $out == *$'\n'* ]] || return 1
@@ -1053,7 +1107,7 @@ fs_usage_of() {
     clean "$mnt"
     mnt=$REPLY
     fmt_x10 "$pct"
-    REPLY="$REPLY% used · $free free ($mnt)"
+    REPLY="$REPLY% band · $free boʻsh ($mnt)"
 }
 
 # ============================================================================
@@ -1762,18 +1816,18 @@ get_pterodactyl_info() {
         fi
         if [[ -z $PTERO_SOURCE ]]; then
             if (( EUID != 0 )); then
-                PTERO_NOTE="run as root to count servers"
+                PTERO_NOTE="serverlarni sanash uchun root huquqi kerak"
             elif (( ! DOCKER_ACCESS )); then
-                PTERO_NOTE="Wings API and Docker unavailable"
+                PTERO_NOTE="Wings API ham, Docker ham mavjud emas"
             fi
         fi
     elif (( PANEL_DB_OK )); then
         # Panel-only host: totals come from the database; power state lives on the nodes
         PTERO_SERVERS=$PANEL_SERVERS PTERO_SUSPENDED=$PANEL_SUSPENDED
         PTERO_SOURCE="Panel DB"
-        PTERO_NOTE="power state is tracked by the Wings nodes"
+        PTERO_NOTE="onlayn/oflayn holat Wings nodelarida saqlanadi"
     elif (( EUID != 0 )); then
-        PTERO_NOTE="run as root to count servers"
+        PTERO_NOTE="serverlarni sanash uchun root huquqi kerak"
     fi
 }
 
@@ -1853,10 +1907,10 @@ load_color() {
     if (( per >= 100 )); then REPLY=$C_RED; elif (( per >= 70 )); then REPLY=$C_YELLOW; else REPLY=$C_GREEN; fi
 }
 
-# temp_value CELSIUS -> REPLY (colored "52°C" or N/A)
+# temp_value CELSIUS -> REPLY (colored "52°C" or nomaʼlum)
 temp_value() {
     if ! is_uint "$1"; then
-        REPLY="${C_GRAY}N/A${C_RST}"
+        REPLY="${C_GRAY}${NA}${C_RST}"
         return
     fi
     local c=$C_GREEN
@@ -1869,7 +1923,7 @@ print_header() {
     local l1 l2
     format_duration "$SYS_UPTIME_S" short
     l1="$SYS_HOSTNAME  ·  $SYS_OS_SHORT"
-    l2="up $REPLY  ·  $SYS_DATETIME"
+    l2="ishlamoqda: $REPLY  ·  $SYS_DATETIME"
     if [[ $1 == full ]]; then
         print_logo
         print_box "$l1" "$C_BOLD$C_WHITE$SYS_HOSTNAME$C_RST  $C_GRAY·$C_RST  $C_CYAN$SYS_OS_SHORT$C_RST" \
@@ -1881,93 +1935,93 @@ print_header() {
 }
 
 print_footer() {
-    local now el right left="EliteHost • Server Infrastructure" gap
+    local now el right left="EliteHost • Server infratuzilmasi" gap
     now=${EPOCHREALTIME//[!0-9]/}
     el=$(( (now - SI_START_US) / 10000 ))
-    printf -v right 'v%s · %d.%02ds' "$SI_VERSION" $(( el / 100 )) $(( el % 100 ))
+    printf -v right 'v%s · %d.%02d s' "$SI_VERSION" $(( el / 100 )) $(( el % 100 ))
     gap=$(( W - ${#left} - ${#right} ))
     (( gap < 2 )) && gap=2
-    printf '\n %s%sEliteHost%s %s•%s %sServer Infrastructure%s%*s%s%s%s\n\n' \
+    printf '\n %s%sEliteHost%s %s•%s %sServer infratuzilmasi%s%*s%s%s%s\n\n' \
         "$C_BOLD" "$C_BRAND" "$C_RST" "$C_GRAY" "$C_RST" "$C_WHITE" "$C_RST" "$gap" '' "$C_GRAY" "$right" "$C_RST"
 }
 
 render_system() {
-    print_section "SYSTEM"
-    print_kv "OS" "$SYS_OS"
-    [[ -n $SYS_DEBIAN_VERSION ]] && print_kv "Debian Version" "$SYS_DEBIAN_VERSION"
-    print_kv "Kernel" "${SYS_KERNEL:-N/A}"
-    print_kv "Architecture" "${SYS_ARCH:-N/A}"
-    print_kv "Hostname" "$SYS_HOSTNAME" "$C_CYAN"
+    print_section "TIZIM"
+    print_kv "Operatsion tizim" "$SYS_OS"
+    [[ -n $SYS_DEBIAN_VERSION ]] && print_kv "Debian versiyasi" "$SYS_DEBIAN_VERSION"
+    print_kv "Yadro" "${SYS_KERNEL:-$NA}"
+    print_kv "Arxitektura" "${SYS_ARCH:-$NA}"
+    print_kv "Xost nomi" "$SYS_HOSTNAME" "$C_CYAN"
     format_duration "$SYS_UPTIME_S"
-    print_kv "Uptime" "$REPLY"
-    print_kv "Boot Time" "$SYS_BOOT_TIME"
-    print_kv "Date/Time" "$SYS_DATETIME"
-    print_kv "Timezone" "$SYS_TIMEZONE ($SYS_UTC_OFFSET)"
-    print_kv "Virtualization" "$SYS_VIRT_LABEL"
-    print_kv "Manufacturer" "${SYS_VENDOR:-N/A}"
-    print_kv "Model" "${SYS_MODEL:-N/A}"
+    print_kv "Ishlash vaqti" "$REPLY"
+    print_kv "Ishga tushgan" "$SYS_BOOT_TIME"
+    print_kv "Sana va vaqt" "$SYS_DATETIME"
+    print_kv "Vaqt mintaqasi" "$SYS_TIMEZONE ($SYS_UTC_OFFSET)"
+    print_kv "Virtualizatsiya" "${SYS_VIRT_LABEL:-$NA}"
+    print_kv "Ishlab chiqaruvchi" "${SYS_VENDOR:-$NA}"
+    print_kv "Model" "${SYS_MODEL:-$NA}"
 }
 
 render_cpu() {
-    local load="N/A"
-    print_section "CPU"
-    print_kv "Model" "$CPU_MODEL"
-    print_kv "Cores" "${CPU_CORES:-N/A}"
-    print_kv "Threads" "${CPU_THREADS:-N/A}"
-    is_uint "$CPU_SOCKETS" && (( CPU_SOCKETS > 1 )) && print_kv "Sockets" "$CPU_SOCKETS"
+    local load=$NA
+    print_section "PROTSESSOR"
+    print_kv "Model" "${CPU_MODEL:-$NA}"
+    print_kv "Yadrolar" "${CPU_CORES:-$NA}"
+    print_kv "Oqimlar" "${CPU_THREADS:-$NA}"
+    is_uint "$CPU_SOCKETS" && (( CPU_SOCKETS > 1 )) && print_kv "Soketlar" "$CPU_SOCKETS"
     usage_value "${CPU_USAGE_X10:-0}" "$CFG_CPU_WARN" "$CFG_CPU_CRIT"
-    print_kv "Usage" "$REPLY" ""
+    print_kv "Yuklanish" "$REPLY" ""
     if [[ -n $CPU_LOAD1 ]]; then
         load_color "$CPU_LOAD1"
-        load="$REPLY$CPU_LOAD1$C_RST / $CPU_LOAD5 / $CPU_LOAD15  $C_GRAY(1/5/15 min)$C_RST"
+        load="$REPLY$CPU_LOAD1$C_RST / $CPU_LOAD5 / $CPU_LOAD15  $C_GRAY(1/5/15 daq)$C_RST"
     fi
-    print_kv "Load Average" "$load"
+    print_kv "Oʻrtacha yuklama" "$load"
     format_mhz "$CPU_FREQ_MHZ"
-    print_kv "Frequency" "$REPLY"
+    print_kv "Chastota" "$REPLY"
     format_mhz "$CPU_MAX_MHZ"
-    print_kv "Max Frequency" "$REPLY"
+    print_kv "Maksimal chastota" "$REPLY"
     temp_value "$CPU_TEMP_C"
-    print_kv "Temperature" "$REPLY"
-    print_kv "Architecture" "${SYS_ARCH:-N/A}"
-    [[ -n $CPU_TASKS ]] && print_kv "Processes" "$CPU_TASKS total, $CPU_RUNNING running"
+    print_kv "Harorat" "$REPLY"
+    print_kv "Arxitektura" "${SYS_ARCH:-$NA}"
+    [[ -n $CPU_TASKS ]] && print_kv "Jarayonlar" "$CPU_TASKS ta, $CPU_RUNNING tasi ishlayapti"
 }
 
 render_memory() {
     local u
-    print_section "MEMORY"
-    human_bytes "$MEM_TOTAL";     print_kv "Total" "$REPLY"
-    human_bytes "$MEM_USED";      print_kv "Used" "$REPLY"
-    human_bytes "$MEM_AVAILABLE"; print_kv "Available" "$REPLY"
-    human_bytes "$MEM_FREE";      print_kv "Free" "$REPLY"
-    human_bytes "$MEM_CACHED";    print_kv "Cached" "$REPLY"
+    print_section "XOTIRA"
+    human_bytes "$MEM_TOTAL";     print_kv "Jami" "$REPLY"
+    human_bytes "$MEM_USED";      print_kv "Ishlatilgan" "$REPLY"
+    human_bytes "$MEM_AVAILABLE"; print_kv "Mavjud" "$REPLY"
+    human_bytes "$MEM_FREE";      print_kv "Boʻsh" "$REPLY"
+    human_bytes "$MEM_CACHED";    print_kv "Kesh" "$REPLY"
     usage_value "$MEM_PCT_X10" "$CFG_RAM_WARN" "$CFG_RAM_CRIT"
-    print_kv "Usage" "$REPLY" ""
+    print_kv "Bandlik" "$REPLY" ""
     if (( SWAP_TOTAL > 0 )); then
-        human_bytes "$SWAP_TOTAL"; print_kv "Swap Total" "$REPLY"
+        human_bytes "$SWAP_TOTAL"; print_kv "Swap jami" "$REPLY"
         human_bytes "$SWAP_USED"; u=$REPLY
         fmt_x10 "$SWAP_PCT_X10"
-        print_kv "Swap Used" "$u ($REPLY%)"
-        human_bytes "$SWAP_FREE"; print_kv "Swap Free" "$REPLY"
+        print_kv "Swap ishlatilgan" "$u ($REPLY%)"
+        human_bytes "$SWAP_FREE"; print_kv "Swap boʻsh" "$REPLY"
     else
-        print_kv "Swap" "Disabled" "$C_GRAY"
+        print_kv "Swap" "oʻchirilgan" "$C_GRAY"
     fi
 }
 
 render_storage() {
     local dev=$ROOT_KIND entry m t s u a p src size used c
-    print_section "STORAGE"
-    [[ -n $ROOT_LAYOUT ]] && dev+=" · $ROOT_LAYOUT"
-    print_kv "Device" "${dev:-N/A}" "$C_CYAN"
-    [[ -n $ROOT_MODEL ]] && print_kv "Disk Model" "$ROOT_MODEL"
-    print_kv "Mount" "/"
-    print_kv "Filesystem" "${ROOT_FSTYPE:-N/A}${ROOT_SRC:+  $C_GRAY$ROOT_SRC$C_RST}"
-    human_bytes "$ROOT_SIZE";  print_kv "Total" "$REPLY"
-    human_bytes "$ROOT_USED";  print_kv "Used" "$REPLY"
-    human_bytes "$ROOT_AVAIL"; print_kv "Free" "$REPLY"
+    print_section "DISK"
+    [[ -n $dev && -n $ROOT_LAYOUT ]] && dev+=" · $ROOT_LAYOUT"
+    print_kv "Qurilma" "${dev:-$NA}" "$C_CYAN"
+    [[ -n $ROOT_MODEL ]] && print_kv "Disk modeli" "$ROOT_MODEL"
+    print_kv "Ulanish nuqtasi" "/"
+    print_kv "Fayl tizimi" "${ROOT_FSTYPE:-$NA}${ROOT_SRC:+  $C_GRAY$ROOT_SRC$C_RST}"
+    human_bytes "$ROOT_SIZE";  print_kv "Jami" "$REPLY"
+    human_bytes "$ROOT_USED";  print_kv "Ishlatilgan" "$REPLY"
+    human_bytes "$ROOT_AVAIL"; print_kv "Boʻsh" "$REPLY"
     usage_value "$ROOT_PCT_X10" "$CFG_DISK_WARN" "$CFG_DISK_CRIT"
-    print_kv "Usage" "$REPLY" ""
+    print_kv "Bandlik" "$REPLY" ""
     (( ${#FS_LIST[@]} > 0 )) || return 0
-    printf '\n %s%-20s %-6s %9s %9s %6s%s\n' "$C_GRAY" "Mount" "Type" "Size" "Used" "Use%" "$C_RST"
+    printf '\n %s%-20s %-6s %9s %11s %6s%s\n' "$C_GRAY" "Ulanish nuqtasi" "Turi" "Hajmi" "Ishlatilgan" "Band" "$C_RST"
     for entry in "${FS_LIST[@]}"; do
         IFS=$FS_SEP read -r m t s u a p src <<< "$entry"
         (( ${#m} > 20 )) && m="...${m: -17}"
@@ -1975,85 +2029,94 @@ render_storage() {
         human_bytes "$u"; used=$REPLY
         level_color "$p" "$CFG_DISK_WARN" "$CFG_DISK_CRIT"
         c=$REPLY
+        pad "$m" 20
+        m=$REPLY
         fmt_x10 "$p"
-        printf ' %-20s %-6s %9s %9s %s%5s%%%s\n' "$m" "${t:0:6}" "$size" "$used" "$C_BOLD$c" "$REPLY" "$C_RST"
+        printf ' %s %-6s %9s %11s %s%5s%%%s\n' "$m" "${t:0:6}" "$size" "$used" "$C_BOLD$c" "$REPLY" "$C_RST"
     done
 }
 
 render_network() {
     local detail=${1:-} v c entry name st ip
-    print_section "NETWORK"
+    print_section "TARMOQ"
     if [[ -z $NET_IFACE ]]; then
-        print_kv "Status" "NO NETWORK" "$C_RED"
+        print_kv "Holati" "TARMOQ YOʻQ" "$C_RED"
         return 0
     fi
-    print_kv "Interface" "$NET_IFACE" "$C_CYAN"
+    print_kv "Interfeys" "$NET_IFACE" "$C_CYAN"
     case ${NET_STATE,,} in up) c=$C_GREEN ;; down) c=$C_RED ;; *) c=$C_YELLOW ;; esac
-    print_kv "State" "${NET_STATE^^}" "$c$C_BOLD"
-    print_kv "Link Speed" "${NET_SPEED:-N/A}"
-    v=${NET_IPV4:-N/A}
-    (( NET_IPV4_EXTRA > 0 )) && v+="  $C_GRAY(+$NET_IPV4_EXTRA more)$C_RST"
+    link_label "$NET_STATE"
+    print_kv "Holati" "$REPLY" "$c$C_BOLD"
+    print_kv "Ulanish tezligi" "${NET_SPEED:-$NA}"
+    v=${NET_IPV4:-$NONE_TXT}
+    (( NET_IPV4_EXTRA > 0 )) && v+="  $C_GRAY(yana $NET_IPV4_EXTRA ta)$C_RST"
     print_kv "IPv4" "$v"
-    print_kv "IPv6" "${NET_IPV6:-N/A}"
+    print_kv "IPv6" "${NET_IPV6:-$NONE_TXT}"
     if [[ -n $NET_PUBLIC_IP ]]; then
-        print_kv "Public IP" "$NET_PUBLIC_IP" "$C_CYAN"
+        print_kv "Ommaviy IP" "$NET_PUBLIC_IP" "$C_CYAN"
     elif [[ -n $NET_IPV4 ]]; then
-        print_kv "Public IP" "N/A  (private address / NAT)"
+        print_kv "Ommaviy IP" "$NONE_TXT  (xususiy manzil / NAT)"
     else
-        print_kv "Public IP" "N/A"
+        print_kv "Ommaviy IP" "$NONE_TXT"
     fi
-    print_kv "Gateway" "${NET_GATEWAY:-N/A}"
-    print_kv "DNS" "${NET_DNS:-N/A}"
-    human_bytes "$NET_RX"; print_kv "RX" "$REPLY"
-    human_bytes "$NET_TX"; print_kv "TX" "$REPLY"
+    print_kv "Shlyuz" "${NET_GATEWAY:-$NONE_TXT}"
+    print_kv "DNS" "${NET_DNS:-$NA}"
+    human_bytes "$NET_RX"; print_kv "Qabul (RX)" "$REPLY"
+    human_bytes "$NET_TX"; print_kv "Uzatish (TX)" "$REPLY"
     [[ $detail == detail ]] || return 0
-    print_kv "MTU" "${NET_MTU:-N/A}"
+    print_kv "MTU" "${NET_MTU:-$NA}"
     if (( NET_IPV4_EXTRA > 0 )); then
         local i shown=0
         for (( i = 1; i < ${#NET_IPV4_ALL[@]}; i++ )); do
             if (( shown == 8 )); then
-                print_kv "" "$C_GRAY(+$(( ${#NET_IPV4_ALL[@]} - 1 - shown )) more)$C_RST" ""
+                print_kv "" "$C_GRAY(yana $(( ${#NET_IPV4_ALL[@]} - 1 - shown )) ta)$C_RST" ""
                 break
             fi
-            if (( shown == 0 )); then print_kv "Extra IPv4" "${NET_IPV4_ALL[i]}"; else print_kv "" "${NET_IPV4_ALL[i]}"; fi
+            if (( shown == 0 )); then print_kv "Qoʻshimcha IPv4" "${NET_IPV4_ALL[i]}"; else print_kv "" "${NET_IPV4_ALL[i]}"; fi
             shown=$(( shown + 1 ))
         done
     fi
     (( ${#NET_OTHER[@]} > 0 )) || return 0
-    printf '\n %s%-18s %-10s %s%s\n' "$C_GRAY" "Interface" "State" "IPv4" "$C_RST"
+    printf '\n %s%-18s %-10s %s%s\n' "$C_GRAY" "Interfeys" "Holati" "IPv4" "$C_RST"
     for entry in "${NET_OTHER[@]}"; do
         IFS=$FS_SEP read -r name st ip <<< "$entry"
         case $st in up) c=$C_GREEN ;; down) c=$C_RED ;; *) c=$C_GRAY ;; esac
-        printf ' %-18s %s%-10s%s %s\n' "${name:0:18}" "$c" "${st^^}" "$C_RST" "${ip:--}"
+        pad "${name:0:18}" 18
+        name=$REPLY
+        link_label "$st"
+        pad "$REPLY" 10
+        printf ' %s %s%s%s %s\n' "$name" "$c" "$REPLY" "$C_RST" "${ip:--}"
     done
 }
 
 render_docker() {
     print_section "DOCKER"
     if (( ! DOCKER_INSTALLED )); then
-        print_kv "Docker" "NOT INSTALLED" "$C_GRAY"
+        print_kv "Docker" "OʻRNATILMAGAN" "$C_GRAY"
         return 0
     fi
     state_color "$DOCKER_STATE"
-    print_kv "Status" "$DOCKER_STATE" "$REPLY$C_BOLD"
-    print_kv "Version" "${DOCKER_VERSION:-N/A}"
+    local color=$REPLY
+    state_label "$DOCKER_STATE"
+    print_kv "Holati" "$REPLY" "$color$C_BOLD"
+    print_kv "Versiya" "${DOCKER_VERSION:-$NA}"
     if (( DOCKER_ACCESS )); then
-        print_kv "Containers" "$DOCKER_CONTAINERS"
-        print_kv "Running" "$DOCKER_RUNNING" "$C_GREEN"
-        print_kv "Stopped" "$DOCKER_STOPPED"
-        (( ${DOCKER_PAUSED:-0} > 0 )) && print_kv "Paused" "$DOCKER_PAUSED" "$C_YELLOW"
-        print_kv "Images" "$DOCKER_IMAGES"
-        print_kv "Storage Driver" "${DOCKER_DRIVER:-N/A}"
-        print_kv "Root Dir" "${DOCKER_ROOT:-N/A}"
+        print_kv "Konteynerlar" "$DOCKER_CONTAINERS"
+        print_kv "Ishlayotgan" "$DOCKER_RUNNING" "$C_GREEN"
+        print_kv "Toʻxtagan" "$DOCKER_STOPPED"
+        (( ${DOCKER_PAUSED:-0} > 0 )) && print_kv "Pauzada" "$DOCKER_PAUSED" "$C_YELLOW"
+        print_kv "Obrazlar" "$DOCKER_IMAGES"
+        print_kv "Saqlash drayveri" "${DOCKER_DRIVER:-$NA}"
+        print_kv "Asosiy papka" "${DOCKER_ROOT:-$NA}"
     elif [[ $DOCKER_STATE == "NO ACCESS" ]]; then
-        print_kv "Note" "run as root (or docker group) for details" "$C_GRAY"
+        print_kv "Izoh" "batafsil maʼlumot uchun root yoki docker guruhi kerak" "$C_GRAY"
     fi
 }
 
-# web_service_label NAME -> REPLY ("nginx (active)")
+# web_service_label NAME -> REPLY ("nginx (faol)")
 web_service_label() {
     service_state "$1" "$1"
-    [[ $REPLY == missing ]] && REPLY=inactive
+    svc_label "$REPLY"
     REPLY="$1 ($REPLY)"
 }
 
@@ -2061,24 +2124,29 @@ render_pterodactyl() {
     local v c
     print_section "PTERODACTYL"
     if (( ! PTERO_DETECTED )); then
-        print_kv "Status" "NOT DETECTED" "$C_GRAY"
+        print_kv "Holati" "ANIQLANMADI" "$C_GRAY"
         return 0
     fi
     if (( PANEL_DETECTED )); then
-        print_kv "Panel" "$C_GREEN${C_BOLD}DETECTED$C_RST${PANEL_VERSION:+  ${C_GRAY}v$PANEL_VERSION$C_RST}" ""
-        print_kv "Panel Path" "$PANEL_PATH"
+        print_kv "Panel" "$C_GREEN${C_BOLD}ANIQLANDI$C_RST${PANEL_VERSION:+  ${C_GRAY}v$PANEL_VERSION$C_RST}" ""
+        print_kv "Panel joylashuvi" "$PANEL_PATH"
         if [[ -n $PANEL_WEBSERVER ]]; then
             web_service_label "$PANEL_WEBSERVER"
-            print_kv "Web Server" "$REPLY"
+            print_kv "Veb-server" "$REPLY"
         fi
         service_state pteroq
-        [[ $REPLY != missing ]] && print_kv "Queue Worker" "pteroq ($REPLY)"
+        if [[ $REPLY != missing ]]; then
+            svc_label "$REPLY"
+            print_kv "Navbat xizmati" "pteroq ($REPLY)"
+        fi
     else
-        print_kv "Panel" "NOT DETECTED" "$C_GRAY"
+        print_kv "Panel" "ANIQLANMADI" "$C_GRAY"
     fi
     if (( WINGS_INSTALLED )); then
         state_color "$WINGS_STATE"
-        print_kv "Wings" "$REPLY$C_BOLD$WINGS_STATE$C_RST${WINGS_VERSION:+  ${C_GRAY}v$WINGS_VERSION$C_RST}" ""
+        c=$REPLY
+        state_label "$WINGS_STATE"
+        print_kv "Wings" "$c$C_BOLD$REPLY$C_RST${WINGS_VERSION:+  ${C_GRAY}v$WINGS_VERSION$C_RST}" ""
         if [[ -r $CFG_WINGS_CONFIG ]]; then
             v=":$WINGS_API_PORT"
             [[ $WINGS_API_TLS == true ]] && v+=" (HTTPS)" || v+=" (HTTP)"
@@ -2086,57 +2154,65 @@ render_pterodactyl() {
             print_kv "Wings API" "$v"
         fi
     else
-        print_kv "Wings" "NOT INSTALLED" "$C_GRAY"
+        print_kv "Wings" "OʻRNATILMAGAN" "$C_GRAY"
     fi
     state_color "$DOCKER_STATE"
-    print_kv "Docker" "$DOCKER_STATE" "$REPLY$C_BOLD"
+    c=$REPLY
+    state_label "$DOCKER_STATE"
+    print_kv "Docker" "$REPLY" "$c$C_BOLD"
     if (( WINGS_INSTALLED )); then
-        print_kv "Game Data" "$WINGS_DATA_DIR"
-        fs_usage_of "$WINGS_DATA_DIR" && print_kv "Data Disk" "$REPLY" "$C_GRAY"
+        print_kv "Oʻyin maʼlumotlari" "$WINGS_DATA_DIR"
+        fs_usage_of "$WINGS_DATA_DIR" && print_kv "Maʼlumot diski" "$REPLY" "$C_GRAY"
     fi
 
-    print_kv "Servers" "${PTERO_SERVERS:-N/A}" "$C_BOLD$C_WHITE"
-    print_kv "Online" "${PTERO_ONLINE:-N/A}" "$C_GREEN"
+    print_kv "Serverlar" "${PTERO_SERVERS:-$NA}" "$C_BOLD$C_WHITE"
+    print_kv "Onlayn" "${PTERO_ONLINE:-$NA}" "$C_GREEN"
     c=$C_WHITE
     [[ -n $PTERO_OFFLINE ]] && (( PTERO_OFFLINE > 0 )) && c=$C_RED
-    print_kv "Offline" "${PTERO_OFFLINE:-N/A}" "$c"
-    [[ -n $PTERO_STARTING ]] && (( PTERO_STARTING > 0 )) && print_kv "Starting" "$PTERO_STARTING" "$C_YELLOW"
-    [[ -n $PTERO_SUSPENDED ]] && (( PTERO_SUSPENDED > 0 )) && print_kv "Suspended" "$PTERO_SUSPENDED" "$C_YELLOW"
-    [[ -n $PTERO_SOURCE ]] && print_kv "Source" "$PTERO_SOURCE" "$C_GRAY"
-    [[ -n $PTERO_NOTE ]] && print_kv "Note" "$PTERO_NOTE" "$C_GRAY"
+    print_kv "Oflayn" "${PTERO_OFFLINE:-$NA}" "$c"
+    [[ -n $PTERO_STARTING ]] && (( PTERO_STARTING > 0 )) && print_kv "Ishga tushmoqda" "$PTERO_STARTING" "$C_YELLOW"
+    [[ -n $PTERO_SUSPENDED ]] && (( PTERO_SUSPENDED > 0 )) && print_kv "Muzlatilgan" "$PTERO_SUSPENDED" "$C_YELLOW"
+    if [[ -n $PTERO_SOURCE ]]; then
+        source_label "$PTERO_SOURCE"
+        print_kv "Manba" "$REPLY" "$C_GRAY"
+    fi
+    [[ -n $PTERO_NOTE ]] && print_kv "Izoh" "$PTERO_NOTE" "$C_GRAY"
     if (( PANEL_DB_OK && WINGS_INSTALLED )); then
-        print_kv "Panel Total" "$PANEL_SERVERS servers · $PANEL_NODES nodes"
+        print_kv "Panel jami" "$PANEL_SERVERS ta server · $PANEL_NODES ta node"
     elif (( PANEL_DB_OK )); then
-        print_kv "Nodes" "$PANEL_NODES"
+        print_kv "Nodelar" "$PANEL_NODES"
     fi
 }
 
-# status_line LABEL STATE [DETAIL]
+# status_line LABEL STATE_CODE [DETAIL]
 status_line() {
-    local color
+    local color label
     if [[ -z ${3:-} ]]; then
         print_status "$1" "$2"
         return 0
     fi
     state_color "$2"
     color=$REPLY
-    pad "$2" 10
-    printf ' %s●%s %-13s%s%s%s%s %s%s%s\n' "$color" "$C_RST" "$1" "$C_BOLD" "$color" "$REPLY" "$C_RST" "$C_GRAY" "$3" "$C_RST"
+    pad "$1" 14
+    label=$REPLY
+    state_label "$2"
+    pad "$REPLY" 15
+    printf ' %s●%s %s%s%s%s%s %s%s%s\n' "$color" "$C_RST" "$label" "$C_BOLD" "$color" "$REPLY" "$C_RST" "$C_GRAY" "$3" "$C_RST"
 }
 
 render_status() {
     local d
-    print_section "STATUS"
-    fmt_x10 "${CPU_USAGE_X10:-0}";  status_line "CPU" "$HEALTH_CPU" "$REPLY%"
-    fmt_x10 "$MEM_PCT_X10";         status_line "RAM" "$HEALTH_RAM" "$REPLY%"
-    fmt_x10 "$DISK_WORST_PCT_X10";  status_line "STORAGE" "$HEALTH_DISK" "$REPLY% ($DISK_WORST_MOUNT)"
+    print_section "HOLAT"
+    fmt_x10 "${CPU_USAGE_X10:-0}";  status_line "PROTSESSOR" "$HEALTH_CPU" "$REPLY%"
+    fmt_x10 "$MEM_PCT_X10";         status_line "XOTIRA" "$HEALTH_RAM" "$REPLY%"
+    fmt_x10 "$DISK_WORST_PCT_X10";  status_line "DISK" "$HEALTH_DISK" "$REPLY% ($DISK_WORST_MOUNT)"
     status_line "WINGS" "$HEALTH_WINGS"
     status_line "DOCKER" "$HEALTH_DOCKER"
     d=""
-    [[ -n $PTERO_SERVERS ]] && d="$PTERO_SERVERS servers${PTERO_ONLINE:+ · $PTERO_ONLINE online}"
+    [[ -n $PTERO_SERVERS ]] && d="$PTERO_SERVERS ta server${PTERO_ONLINE:+ · $PTERO_ONLINE tasi onlayn}"
     status_line "PTERODACTYL" "$HEALTH_PTERO" "$d"
     printf ' %s%s%s\n' "$C_GRAY" "${RULE:0:24}" "$C_RST"
-    status_line "OVERALL" "$HEALTH_OVERALL"
+    status_line "UMUMIY" "$HEALTH_OVERALL"
 }
 
 # ============================================================================
@@ -2415,13 +2491,15 @@ live_cleanup() {
 
 # live_bar LABEL PCT_X10 WARN CRIT DETAIL
 live_bar() {
-    local color bar
+    local color bar label
     level_color "$2" "$3" "$4"
     color=$REPLY
     make_bar "$2" "$LIVE_BAR_W" "$color"
     bar=$REPLY
+    pad "$1" 10
+    label=$REPLY
     fmt_x10 "$2"
-    printf ' %s%-5s%s %s %s%s%5s%%%s  %s%s%s\n' "$C_BOLD$C_WHITE" "$1" "$C_RST" "$bar" \
+    printf ' %s%s%s %s %s%s%5s%%%s  %s%s%s\n' "$C_BOLD$C_WHITE" "$label" "$C_RST" "$bar" \
         "$C_BOLD" "$color" "$REPLY" "$C_RST" "$C_GRAY" "$5" "$C_RST"
 }
 
@@ -2429,7 +2507,7 @@ live_bar() {
 live_cols() {
     local out="" n
     while (( $# >= 3 )); do
-        pad "$1" 9
+        pad "$1" 11
         out+=" $C_GRAY$REPLY$C_RST"
         n=$(( 17 - ${#2} ))
         (( n < 1 )) && n=1
@@ -2441,17 +2519,17 @@ live_cols() {
 }
 
 render_live_frame() {
-    local l1 u r c v1 v2 clock
+    local l1 u r c v1 v2 clock label
     format_duration "$SYS_UPTIME_S" short
-    l1="$SYS_HOSTNAME  ·  $SYS_OS_SHORT  ·  up $REPLY"
-    print_box "ELITEHOST SERVERINFO  ·  LIVE" \
-        "$C_BOLD${C_BRAND}ELITEHOST$C_RST $C_BOLD${C_WHITE}SERVERINFO$C_RST  $C_GRAY·$C_RST  $C_GREEN${C_BOLD}LIVE$C_RST" \
+    l1="$SYS_HOSTNAME  ·  $SYS_OS_SHORT  ·  ishlamoqda: $REPLY"
+    print_box "ELITEHOST SERVERINFO  ·  JONLI" \
+        "$C_BOLD${C_BRAND}ELITEHOST$C_RST $C_BOLD${C_WHITE}SERVERINFO$C_RST  $C_GRAY·$C_RST  $C_GREEN${C_BOLD}JONLI$C_RST" \
         "$l1" "$C_GRAY$l1$C_RST"
     echo
-    live_bar "CPU" "${CPU_USAGE_X10:-0}" "$CFG_CPU_WARN" "$CFG_CPU_CRIT" "${CPU_THREADS:-?} threads"
+    live_bar "PROTSESSOR" "${CPU_USAGE_X10:-0}" "$CFG_CPU_WARN" "$CFG_CPU_CRIT" "${CPU_THREADS:-?} ta oqim"
     human_bytes "$MEM_USED"; u=$REPLY
     human_bytes "$MEM_TOTAL"
-    live_bar "RAM" "$MEM_PCT_X10" "$CFG_RAM_WARN" "$CFG_RAM_CRIT" "$u / $REPLY"
+    live_bar "XOTIRA" "$MEM_PCT_X10" "$CFG_RAM_WARN" "$CFG_RAM_CRIT" "$u / $REPLY"
     if (( SWAP_TOTAL > 0 )); then
         human_bytes "$SWAP_USED"; u=$REPLY
         human_bytes "$SWAP_TOTAL"
@@ -2467,32 +2545,38 @@ render_live_frame() {
     temp_value "$CPU_TEMP_C"
     v2=$REPLY
     u=${CPU_TEMP_C:+$CPU_TEMP_C°C}
-    live_cols "Load" "$v1" "$c$v1$C_RST" "Temp" "${u:-N/A}" "$v2"
+    live_cols "Yuklama" "$v1" "$c$v1$C_RST" "Harorat" "${u:-$NA}" "$v2"
     format_mhz "$CPU_FREQ_MHZ"
     v1=$REPLY
-    live_cols "Freq" "$v1" "$C_WHITE$v1$C_RST" "Tasks" "${CPU_TASKS:-N/A}" "$C_WHITE${CPU_TASKS:-N/A}$C_RST"
+    live_cols "Chastota" "$v1" "$C_WHITE$v1$C_RST" "Jarayonlar" "${CPU_TASKS:-$NA}" "$C_WHITE${CPU_TASKS:-$NA}$C_RST"
     if [[ -n $NET_IFACE ]]; then
         human_bytes "$LIVE_RX_RATE"; r="↓ $REPLY/s"
         human_bytes "$LIVE_TX_RATE"; r+="   ↑ $REPLY/s"
-        printf ' %s%-9s%s%s%-8s%s %s\n' "$C_GRAY" "Network" "$C_RST" "$C_CYAN" "$NET_IFACE" "$C_RST" "$r"
+        pad "Tarmoq" 11
+        label=$REPLY
+        printf ' %s%s%s%s%-8s%s %s\n' "$C_GRAY" "$label" "$C_RST" "$C_CYAN" "$NET_IFACE" "$C_RST" "$r"
     fi
 
     print_section "PTERODACTYL"
     if (( PTERO_DETECTED )); then
         state_color "$WINGS_STATE"; c=$REPLY
-        state_color "$DOCKER_STATE"
-        live_cols "Wings" "● $WINGS_STATE" "$c● $C_BOLD$WINGS_STATE$C_RST" \
-                  "Docker" "● $DOCKER_STATE" "$REPLY● $C_BOLD$DOCKER_STATE$C_RST"
-        v1=${PTERO_SERVERS:-N/A} v2=${PTERO_ONLINE:-N/A} u=${PTERO_OFFLINE:-N/A}
+        state_label "$WINGS_STATE"; v1=$REPLY
+        state_color "$DOCKER_STATE"; u=$REPLY
+        state_label "$DOCKER_STATE"; v2=$REPLY
+        live_cols "Wings" "● $v1" "$c● $C_BOLD$v1$C_RST" \
+                  "Docker" "● $v2" "$u● $C_BOLD$v2$C_RST"
+        v1=${PTERO_SERVERS:-$NA} v2=${PTERO_ONLINE:-$NA} u=${PTERO_OFFLINE:-$NA}
         c=$C_WHITE
         [[ $u =~ ^[1-9] ]] && c=$C_RED
-        live_cols "Servers" "$v1" "$C_BOLD$C_WHITE$v1$C_RST" "Online" "$v2" "$C_GREEN$v2$C_RST"
-        live_cols "Offline" "$u" "$c$u$C_RST" "Source" "${PTERO_SOURCE:-N/A}" "$C_GRAY${PTERO_SOURCE:-N/A}$C_RST"
+        live_cols "Serverlar" "$v1" "$C_BOLD$C_WHITE$v1$C_RST" "Onlayn" "$v2" "$C_GREEN$v2$C_RST"
+        source_label "${PTERO_SOURCE:-$NA}"
+        live_cols "Oflayn" "$u" "$c$u$C_RST" "Manba" "$REPLY" "$C_GRAY$REPLY$C_RST"
     else
-        print_kv "Status" "NOT DETECTED" "$C_GRAY"
+        print_kv "Holati" "ANIQLANMADI" "$C_GRAY"
     fi
     printf -v clock '%(%H:%M:%S)T' -1
-    printf '\n %s%s  ·  refresh %ss  ·  press q or Ctrl+C to exit%s\n' "$C_GRAY" "$clock" "$CFG_LIVE_INTERVAL" "$C_RST"
+    printf '\n %s%s  ·  har %s soniyada yangilanadi  ·  chiqish: q yoki Ctrl+C%s\n' \
+        "$C_GRAY" "$clock" "$CFG_LIVE_INTERVAL" "$C_RST"
 }
 
 LIVE_RX_RATE=0 LIVE_TX_RATE=0
@@ -2500,7 +2584,7 @@ LIVE_RX_RATE=0 LIVE_TX_RATE=0
 live_mode() {
     local key rc frame rx0 tx0 us0 dt
     if [[ ! -t 1 ]]; then
-        msg_err "--live requires an interactive terminal"
+        msg_err "--live faqat interaktiv terminalda ishlaydi"
         return 1
     fi
     LIVE_ACTIVE=1
@@ -2508,7 +2592,7 @@ live_mode() {
     trap 'live_cleanup' EXIT
     trap ':' WINCH
     printf '\e[?1049h\e[?25l\e[H\e[2J'
-    printf '\n  %sEliteHost ServerInfo%s - collecting data...\n' "$C_BRAND" "$C_RST"
+    printf '\n  %sEliteHost ServerInfo%s - maʼlumotlar yigʻilmoqda...\n' "$C_BRAND" "$C_RST"
 
     query_services wings docker nginx apache2 pteroq
     get_system_info
@@ -2522,7 +2606,7 @@ live_mode() {
 
     while :; do
         setup_layout
-        LIVE_BAR_W=$(( W - 36 ))
+        LIVE_BAR_W=$(( W - 42 ))
         (( LIVE_BAR_W > 30 )) && LIVE_BAR_W=30
         (( LIVE_BAR_W < 10 )) && LIVE_BAR_W=10
         measure_cpu_usage 0
@@ -2569,42 +2653,42 @@ print_help() {
     local b=$C_BOLD$C_BRAND r=$C_RST g=$C_GRAY w=$C_BOLD$C_WHITE
     cat <<EOF
 ${b}EliteHost ServerInfo${r} ${g}v${SI_VERSION}${r}
-Server information & monitoring for Pterodactyl hosting nodes (Debian 12/13).
+Pterodactyl hosting serverlari uchun server maʼlumotlari va monitoring (Debian 12/13).
 
-${w}USAGE${r}
-  serverinfo [OPTIONS]
+${w}FOYDALANISH${r}
+  serverinfo [PARAMETRLAR]
 
-${w}VIEWS${r}
-  (no option)          Full overview: system, CPU, memory, storage, network,
-                       Docker, Pterodactyl and health status
-  -l, --live           Live monitor, refreshes every ${CFG_LIVE_INTERVAL}s (q or Ctrl+C to exit)
-      --system         System information
-  -c, --cpu            CPU information
-  -r, --ram            Memory and swap                (alias: --memory)
-  -d, --disk           Storage                        (alias: --storage)
-  -n, --network        Network                        (alias: --net)
-  -p, --pterodactyl    Panel, Wings and game servers  (alias: --ptero)
-      --docker         Docker engine
-  -s, --status         Health status summary          (alias: --health)
-  -j, --json           Valid JSON output (combine with the views above)
+${w}KOʻRINISHLAR${r}
+  (parametrsiz)        Toʻliq hisobot: tizim, protsessor, xotira, disk, tarmoq,
+                       Docker, Pterodactyl va server holati
+  -l, --live           Jonli monitor, har ${CFG_LIVE_INTERVAL} soniyada yangilanadi (chiqish: q yoki Ctrl+C)
+      --system         Tizim maʼlumotlari
+  -c, --cpu            Protsessor
+  -r, --ram            Xotira va swap                   (yoki: --memory)
+  -d, --disk           Disklar                          (yoki: --storage)
+  -n, --network        Tarmoq                           (yoki: --net)
+  -p, --pterodactyl    Panel, Wings va oʻyin serverlari (yoki: --ptero)
+      --docker         Docker
+  -s, --status         Server holati                    (yoki: --health)
+  -j, --json           JSON formatida chiqarish (yuqoridagi koʻrinishlar bilan ishlaydi)
 
-${w}OPTIONS${r}
-  -i, --interval SEC   Live mode refresh interval, 1-60 seconds (default ${CFG_LIVE_INTERVAL})
-      --public-ip      Allow one HTTPS request to detect the public IP behind NAT
-      --no-color       Disable colors (the NO_COLOR variable is honored too)
-      --color          Force colors even when the output is not a terminal
-  -h, --help           Show this help
-  -v, --version        Show the version
-      --uninstall      Remove EliteHost ServerInfo (add --yes to skip the prompt)
+${w}PARAMETRLAR${r}
+  -i, --interval SEK   Jonli rejim yangilanish oraligʻi, 1-60 soniya (standart: ${CFG_LIVE_INTERVAL})
+      --public-ip      NAT ortidagi ommaviy IP uchun bitta HTTPS soʻrovga ruxsat berish
+      --no-color       Ranglarni oʻchirish (NO_COLOR oʻzgaruvchisi ham hisobga olinadi)
+      --color          Chiqish terminal boʻlmasa ham ranglarni yoqish
+  -h, --help           Shu yordam
+  -v, --version        Versiya
+      --uninstall      Dasturni oʻchirish (--yes - tasdiqlashsiz)
 
-${w}EXAMPLES${r}
-  serverinfo                     full report
-  serverinfo --live              live monitor
-  serverinfo -cr                 CPU + memory
-  serverinfo --pterodactyl       panel / wings / game servers
+${w}MISOLLAR${r}
+  serverinfo                     toʻliq hisobot
+  serverinfo --live              jonli monitor
+  serverinfo -cr                 protsessor + xotira
+  serverinfo --pterodactyl       panel / wings / oʻyin serverlari
   serverinfo --json | jq .pterodactyl
 
-${g}Config file: ${SI_CONFIG_FILE}${r}
+${g}Sozlamalar fayli: ${SI_CONFIG_FILE}${r}
 EOF
 }
 
@@ -2636,26 +2720,26 @@ EOF
 
 print_default_config() {
     cat <<'EOF'
-# /etc/elitehost/serverinfo.conf - EliteHost ServerInfo configuration
+# /etc/elitehost/serverinfo.conf - EliteHost ServerInfo sozlamalari
 # ELITEHOST-SERVERINFO
-# Format: KEY=VALUE. This file is parsed, never executed. Invalid values are ignored.
+# Format: KALIT=QIYMAT. Fayl faqat oʻqiladi, hech qachon bajarilmaydi. Notoʻgʻri qiymatlar eʼtiborsiz qoldiriladi.
 
-# Brand color (256-color palette index 0-255) and logo gradient (one index per logo line)
+# Brend rangi (256 rangli palitra indeksi, 0-255) va logotip gradienti (har qatorga bitta indeks)
 BRAND_COLOR=135
 LOGO_COLORS="129 135 99 105 69 75"
 
-# Public IP. If the primary interface has a public IPv4 it is shown directly.
-# Behind NAT, "yes" allows ONE HTTPS request to the service below (default: no).
+# Ommaviy IP. Asosiy interfeysda ommaviy IPv4 boʻlsa, toʻgʻridan-toʻgʻri koʻrsatiladi.
+# NAT ortida "yes" quyidagi servisga BITTA HTTPS soʻrov yuborishga ruxsat beradi (standart: no).
 PUBLIC_IP_LOOKUP=no
 PUBLIC_IP_URL="https://api.ipify.org"
 
 # Pterodactyl
 WINGS_CONFIG=/etc/pterodactyl/config.yml
-PANEL_DIR=                  # empty = auto-detect (/var/www/pterodactyl, nginx/apache roots)
-WINGS_API=auto              # auto | off  - live server states from the local Wings API (root)
-PANEL_DATABASE=auto         # auto | off  - read-only COUNT queries on the panel database (root)
+PANEL_DIR=                  # boʻsh = avtomatik aniqlash (/var/www/pterodactyl, nginx/apache sozlamalari)
+WINGS_API=auto              # auto | off  - serverlar holati lokal Wings API orqali (root)
+PANEL_DATABASE=auto         # auto | off  - panel bazasida faqat COUNT soʻrovlari (root)
 
-# Health thresholds (percent)
+# Holat chegaralari (foiz)
 CPU_WARN=70
 CPU_CRIT=90
 RAM_WARN=80
@@ -2663,7 +2747,7 @@ RAM_CRIT=90
 DISK_WARN=80
 DISK_CRIT=90
 
-# Live mode refresh interval (seconds, 1-60)
+# Jonli rejim yangilanish oraligʻi (soniya, 1-60)
 LIVE_INTERVAL=2
 EOF
 }
@@ -2673,8 +2757,8 @@ do_uninstall() {
     if [[ -f $un ]]; then
         exec bash "$un" "$@"
     fi
-    msg_err "uninstaller not found: $un"
-    echo "Run uninstall.sh from the project directory instead." >&2
+    msg_err "oʻchirish dasturi topilmadi: $un"
+    echo "Uning oʻrniga loyiha papkasidagi uninstall.sh ni ishga tushiring." >&2
     return 1
 }
 
@@ -2771,7 +2855,7 @@ main() {
                 if [[ $s =~ ^[0-9]{1,2}$ ]] && (( 10#$s >= 1 && 10#$s <= 60 )); then
                     CFG_LIVE_INTERVAL=$(( 10#$s ))
                 else
-                    msg_err "--interval expects a number of seconds between 1 and 60"
+                    msg_err "--interval 1 dan 60 gacha boʻlgan soniya qiymatini talab qiladi"
                     return 2
                 fi
                 ;;
@@ -2779,8 +2863,8 @@ main() {
             --completion)            print_completion; return 0 ;;
             --print-config)          print_default_config; return 0 ;;
             *)
-                msg_err "unknown option: $1"
-                echo "Try 'serverinfo --help' for the list of options." >&2
+                msg_err "nomaʼlum parametr: $1"
+                echo "Parametrlar roʻyxati: serverinfo --help" >&2
                 return 2
                 ;;
         esac
@@ -2799,7 +2883,7 @@ main() {
             ;;
         live)
             if (( json )); then
-                msg_err "--live cannot be combined with --json"
+                msg_err "--live va --json birga ishlatilmaydi"
                 return 2
             fi
             setup_colors
